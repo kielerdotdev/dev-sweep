@@ -15,7 +15,7 @@ binary = Path(sys.argv[1] if len(sys.argv) > 1 else 'target/debug/dev-sweep').re
 with tempfile.TemporaryDirectory(prefix='dev-sweep-cancel-') as directory:
     root = Path(directory)
     projects = root / 'projects'
-    for index in range(4):
+    for index in range(12):
         project = projects / str(index)
         (project / 'node_modules').mkdir(parents=True)
         (project / 'package.json').write_text('{}')
@@ -34,10 +34,10 @@ with tempfile.TemporaryDirectory(prefix='dev-sweep-cancel-') as directory:
         workers = []
         while time.monotonic() < deadline:
             workers = pids.read_text().splitlines() if pids.exists() else []
-            if len(workers) == 4:
+            if len(workers) == 8:
                 break
             time.sleep(.02)
-        assert len(workers) == 4, f'expected four active workers, got {workers}'
+        assert len(workers) == 8, f'expected eight active workers, got {workers}'
         started = time.monotonic()
         os.write(master, b'q')
         process.wait(timeout=5)
@@ -48,8 +48,8 @@ with tempfile.TemporaryDirectory(prefix='dev-sweep-cancel-') as directory:
             except ProcessLookupError:
                 continue
             raise AssertionError(f'left measurement worker {worker} running')
-        assert all((projects / str(i) / 'node_modules').exists() for i in range(4))
-        print(f'PTY cancellation passed: all four workers stopped in {time.monotonic() - started:.3f}s; folders preserved.')
+        assert all((projects / str(i) / 'node_modules').exists() for i in range(12))
+        print(f'PTY cancellation passed: all eight workers stopped in {time.monotonic() - started:.3f}s; folders preserved.')
     finally:
         if process.poll() is None:
             process.kill()

@@ -27,7 +27,7 @@ dev-sweep tui
 
 Press **p** or **Enter**, then approve the AI review. The AI returns a checklist with every recommended cleanup checked. Untick exceptions with Space, then type the displayed `DELETE N` phrase and press Enter in that same checklist. There is no separate adoption step.
 
-Rows appear as the scan finishes each folder. You can review finished rows while it scans the rest. Large directories take longer to measure; quitting stops the scan workers.
+Rows appear as the scan finishes each folder. You can review finished rows while it scans the rest. Measurements use shared queues with up to eight active workers across projects, caches and large storage areas. Parent and child scans run separately so they do not compete for the same files. Completed rows appear immediately; large directories take longer, and quitting cancels the workers.
 
 | Key | Action |
 | --- | --- |
@@ -200,6 +200,7 @@ cargo fmt --check
 python3 tests/tui_pty.py
 # The script finds the test-only PTY fixture built by cargo test.
 python3 tests/proposal_pty.py
+python3 tests/measurement_parallel.py
 python3 tests/scan_cancel_pty.py
 cargo build --release --locked
 python3 tests/scan_benchmark.py target/release/dev-sweep

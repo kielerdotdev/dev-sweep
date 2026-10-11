@@ -2,8 +2,75 @@ use super::*;
 use std::sync::mpsc::Sender;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Condvar, Mutex,
 };
+
+const MEASUREMENT_WORKERS: usize = 8;
+static MEASUREMENTS: (Mutex<Vec<PathBuf>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+
+// All scan groups share this limit. A parent and its child must not walk the
+// same files concurrently, even when they belong to different inventory groups.
+struct Measurement(PathBuf);
+impl Measurement {
+    fn acquire(path: &Path) -> std::result::Result<Self, &'static str> {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let (active, wake) = &MEASUREMENTS;
+        let mut active = active.lock().unwrap();
+        loop {
+            if stores::scan_cancelled() {
+                return Err("Scan cancelled");
+            }
+            if active.len() < MEASUREMENT_WORKERS
+                && !active
+                    .iter()
+                    .any(|p| path.starts_with(p) || p.starts_with(&path))
+            {
+                active.push(path.clone());
+                return Ok(Self(path));
+            }
+            active = wake
+                .wait_timeout(active, Duration::from_millis(50))
+                .unwrap()
+                .0;
+        }
+    }
+}
+impl Drop for Measurement {
+    fn drop(&mut self) {
+        let (active, wake) = &MEASUREMENTS;
+        active.lock().unwrap().retain(|p| p != &self.0);
+        wake.notify_all();
+    }
+}
+
+fn parallel<T: Sync>(jobs: &[T], inspect: impl Fn(&T) -> bool + Sync) {
+    let pending = Mutex::new(jobs.iter());
+    let cancel = stores::scan_context();
+    std::thread::scope(|scope| {
+        for _ in 0..MEASUREMENT_WORKERS.min(jobs.len()) {
+            let pending = &pending;
+            let inspect = &inspect;
+            let cancel = cancel.clone();
+            scope.spawn(move || {
+                if let Some(cancel) = cancel {
+                    stores::set_scan_cancel(cancel);
+                }
+                loop {
+                    if stores::scan_cancelled() {
+                        break;
+                    }
+                    let next = pending.lock().unwrap().next();
+                    let Some(job) = next else {
+                        break;
+                    };
+                    if !inspect(job) {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+}
 
 #[derive(Clone, Debug)]
 pub enum Action {
@@ -203,7 +270,11 @@ fn measure(path: &Path) -> Result<u64> {
 }
 
 fn measured(item: &mut Item, path: &Path, tx: &Sender<Event>) {
-    let _ = tx.send(Event::Status(format!("Measuring {}", item.location)));
+    let active = MEASUREMENTS.0.lock().unwrap().len();
+    let _ = tx.send(Event::Status(format!(
+        "Measuring · {active}/{MEASUREMENT_WORKERS} workers · {}",
+        item.location
+    )));
     match measure(path) {
         Ok(bytes) => {
             item.bytes = Some(bytes);
@@ -233,6 +304,13 @@ fn path_item(
     item.scope = Some(path.to_path_buf());
     item.consequence = if group == "Worktrees" { "Removes this entire checkout, including its recognized ignored dependency folders and build output, with git worktree remove without --force. The branch is preserved. No separate cache removal is required." }
         else { "Permanently removes generated files. Dependencies or builds must be recreated; offline rebuilds may fail." }.into();
+    let _measurement = match Measurement::acquire(path) {
+        Ok(measurement) => measurement,
+        Err(error) => {
+            item.blocked = Some(error.into());
+            return item;
+        }
+    };
     let info = match &item.action {
         Action::Artifact(_) => artifact_stats(path, config, busy),
         Action::Global { root, .. } => stores::global_stats(path, root, config, busy),
@@ -334,41 +412,30 @@ fn scan(config: &Config, home: &Path, tx: &Sender<Event>) -> Result<()> {
                 ));
         }
     }
-    // Limit disk concurrency; publish each finished row without waiting for a
-    // large checkout to finish. The same checks still run before deletion.
-    let busy = &busy;
-    let tree_roots = &tree_roots;
-    let bundles = &bundles;
-    let inspect = |candidates: &[PathBuf], worktree: bool| {
-        let context = stores::scan_context();
-        let workers = 4.min(candidates.len());
-        std::thread::scope(|scope| {
-            for worker in 0..workers {
-                let context = context.clone();
-                scope.spawn(move || {
-                    if let Some(context) = context { stores::set_scan_cancel(context); }
-                    for path in candidates.iter().skip(worker).step_by(workers) {
-                        if stores::scan_cancelled() { break; }
-                        let parent = path.ancestors().find(|p| tree_roots.contains(*p)).map(Path::to_path_buf);
-                        let (action, group, measure) = if worktree {
-                            (Action::Worktree(path.clone()), "Worktrees", true)
-                        } else { (Action::Artifact(path.clone()), "Caches", parent.is_none()) };
-                        let mut item = path_item(path, action, config, busy, group, tx, measure);
-                        if worktree {
-                            item.included = bundles.get(path).cloned().unwrap_or_default();
-                            if !item.included.is_empty() { item.label.push_str(&format!(" · {} caches included", item.included.len())); }
-                        } else {
-                            item.parent_worktree = parent;
-                            if item.parent_worktree.is_some() && item.bytes.is_none() { item.size_note = "Included in parent worktree size; individual size not measured".into(); }
-                        }
-                        if !send(tx, item) { break; }
-                    }
-                });
-            }
-        });
-    };
-    inspect(&roots, true);
-    inspect(&paths, false);
+    // Independent caches need not wait for every worktree. Nested caches are
+    // queued after parents; the shared measurement guard also protects overlap.
+    let (nested, independent): (Vec<_>, Vec<_>) = paths
+        .into_iter()
+        .partition(|path| path.ancestors().any(|p| tree_roots.contains(p)));
+    let mut jobs = Vec::new();
+    let mut roots = roots.into_iter();
+    let mut independent = independent.into_iter();
+    loop {
+        let root = roots.next();
+        let path = independent.next();
+        if root.is_none() && path.is_none() {
+            break;
+        }
+        if let Some(root) = root {
+            jobs.push((root.clone(), Action::Worktree(root)));
+        }
+        if let Some(path) = path {
+            jobs.push((path.clone(), Action::Artifact(path)));
+        }
+    }
+    for path in nested {
+        jobs.push((path.clone(), Action::Artifact(path)));
+    }
     if config.global_caches {
         for root in stores::global_roots(home) {
             if !root.is_dir() || config.protects(&root) || fs::canonicalize(&root)? != root {
@@ -376,25 +443,56 @@ fn scan(config: &Config, home: &Path, tx: &Sender<Event>) -> Result<()> {
             }
             for entry in fs::read_dir(&root)? {
                 let path = entry?.path();
-                let action = Action::Global {
-                    path: path.clone(),
-                    root: root.clone(),
-                };
-                if !send(
-                    tx,
-                    path_item(&path, action, config, busy, "Caches", tx, true),
-                ) {
-                    return Ok(());
-                }
+                jobs.push((
+                    path.clone(),
+                    Action::Global {
+                        path,
+                        root: root.clone(),
+                    },
+                ));
             }
         }
     }
+    parallel(&jobs, |(path, action)| {
+        let worktree = matches!(action, Action::Worktree(_));
+        let parent = if matches!(action, Action::Artifact(_)) {
+            path.ancestors()
+                .find(|p| tree_roots.contains(*p))
+                .map(Path::to_path_buf)
+        } else {
+            None
+        };
+        let mut item = path_item(
+            path,
+            action.clone(),
+            config,
+            &busy,
+            if worktree { "Worktrees" } else { "Caches" },
+            tx,
+            parent.is_none(),
+        );
+        if worktree {
+            item.included = bundles.get(path).cloned().unwrap_or_default();
+            if !item.included.is_empty() {
+                item.label
+                    .push_str(&format!(" · {} caches included", item.included.len()));
+            }
+        } else {
+            item.parent_worktree = parent;
+            if item.parent_worktree.is_some() && item.bytes.is_none() {
+                item.size_note =
+                    "Included in parent worktree size; individual size not measured".into();
+            }
+        }
+        send(tx, item)
+    });
     Ok(())
 }
 
 fn scan_stores(config: &Config, home: &Path, tx: &Sender<Event>) -> Result<()> {
     // Managers and large retained areas are visible even when age policy keeps them.
     if config.global_caches {
+        let mut measurements = Vec::new();
         for (name,label,consequence) in [
             ("uv","uv cache","Runs uv cache prune. The manager removes unused entries."),
             ("nix","Nix unreachable store paths","Runs nix-store --gc. Only paths unreachable from GC roots are removed. Generations are preserved."),
@@ -407,12 +505,11 @@ fn scan_stores(config: &Config, home: &Path, tx: &Sender<Event>) -> Result<()> {
             match stores::store_plan(name, config, home) {
                 Ok((program,args,cache)) => {
                     item.location = std::iter::once(program).chain(args.iter().map(|a|format!("{a:?}"))).collect::<Vec<_>>().join(" ");
-                    if let Some(path) = cache { item.scope = Some(path.clone()); measured(&mut item,&path,tx); }
-                    item.size_note.push_str(". Store total, not a prediction of cleanup savings.");
+                    if let Some(path) = cache { item.scope = Some(path); }
                 }
                 Err(e) => item.blocked = Some(e.to_string()),
             }
-            if !send(tx,item) { return Ok(()); }
+            measurements.push(item);
         }
         for (relative, label) in [
             (".android", "Android emulator data"),
@@ -437,13 +534,23 @@ fn scan_stores(config: &Config, home: &Path, tx: &Sender<Event>) -> Result<()> {
             item.blocked =
                 Some("Retained data; remove individual assets using the owning application".into());
             item.consequence = "May contain user data, active toolchains or offline assets. No blanket deletion is offered.".into();
-            if !config.protects(&path) {
-                measured(&mut item, &path, tx);
-            }
-            if !send(tx, item) {
-                return Ok(());
-            }
+            item.scope = Some(path);
+            measurements.push(item);
         }
+        parallel(&measurements, |template| {
+            let mut item = template.clone();
+            if let Some(path) = item.scope.clone().filter(|p| !config.protects(p)) {
+                match Measurement::acquire(&path) {
+                    Ok(_measurement) => measured(&mut item, &path, tx),
+                    Err(error) => item.size_note = error.into(),
+                }
+            }
+            if matches!(item.action, Action::Store(_)) {
+                item.size_note
+                    .push_str(". Store total, not a prediction of cleanup savings.");
+            }
+            send(tx, item)
+        });
     }
     if config.docker && stores::available("docker") {
         if let Err(error) = docker_items(config, tx) {
@@ -658,6 +765,27 @@ pub fn execute(item: &Item, config: &Config, home: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_overlapping_measurement_can_be_cancelled_without_waiting_for_parent() {
+        let parent =
+            env::temp_dir().join(format!("dev-sweep-measurement-wait-{}", std::process::id()));
+        let _measurement = Measurement::acquire(&parent).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let cancel_worker = cancel.clone();
+            scope.spawn(move || {
+                stores::set_scan_cancel(cancel_worker);
+                tx.send(false).unwrap();
+                let result = Measurement::acquire(&parent.join("child"));
+                tx.send(matches!(result, Err("Scan cancelled"))).unwrap();
+            });
+            assert!(!rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            cancel.store(true, Ordering::Relaxed);
+            assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        });
+    }
+
     #[test]
     fn compact_evidence_preserves_blockers_age_and_long_scope_without_truncation() {
         let path = PathBuf::from(format!("/home/user/projects/{}", "x".repeat(2000)));
