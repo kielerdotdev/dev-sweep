@@ -25,6 +25,8 @@ const FILTERS: [&str; 7] = [
 enum Popup {
     Info(String),
     Ai(Vec<Item>),
+    PlanRequest(Vec<Item>),
+    Proposal(Vec<Item>),
     Delete(Vec<Item>, String),
 }
 struct App {
@@ -35,6 +37,7 @@ struct App {
     searching: bool,
     scanning: bool,
     executing: usize,
+    planning: bool,
     status: String,
     popup: Option<Popup>,
     scroll: u16,
@@ -53,6 +56,7 @@ impl App {
             searching: false,
             scanning: true,
             executing: 0,
+            planning: false,
             status: "Reading storage inventory".into(),
             popup: None,
             scroll: 0,
@@ -99,6 +103,61 @@ impl App {
     }
     fn selected(&self) -> Vec<Item> {
         self.items.iter().filter(|i| i.selected).cloned().collect()
+    }
+    fn proposal_candidates(&self) -> Vec<Item> {
+        let mut candidates: Vec<_> = self
+            .visible()
+            .into_iter()
+            .map(|i| &self.items[i])
+            .filter(|i| {
+                i.blocked.is_none()
+                    && !i.reviewing
+                    && i.scope.is_some()
+                    && !matches!(
+                        i.action,
+                        Action::Store(_) | Action::Volume { .. } | Action::Retained
+                    )
+            })
+            .cloned()
+            .collect();
+        // Prefer the containing worktree over its generated children.
+        candidates.sort_by_key(|i| i.scope.as_ref().unwrap().components().count());
+        let mut result: Vec<Item> = Vec::new();
+        for item in candidates {
+            if !result.iter().any(|other| {
+                item.scope
+                    .as_ref()
+                    .unwrap()
+                    .starts_with(other.scope.as_ref().unwrap())
+            }) {
+                result.push(item);
+            }
+        }
+        result
+    }
+    fn adopt_proposal(&mut self, proposed: &[Item]) {
+        if proposed.is_empty() {
+            self.status = "Empty proposal; existing selections kept.".into();
+            return;
+        }
+        for item in &mut self.items {
+            item.selected = false;
+        }
+        for draft in proposed {
+            if let Some(item) = self
+                .items
+                .iter_mut()
+                .find(|i| i.key == draft.key && i.blocked.is_none())
+            {
+                item.selected = true;
+            }
+        }
+        self.filter = 6;
+        self.query.clear();
+        self.cursor = 0;
+        self.scroll = 0;
+        self.status =
+            "Proposal adopted. Space removes exceptions; r opens final deletion approval.".into();
     }
     fn toggle(&mut self) {
         let Some(index) = self.focused() else {
@@ -158,7 +217,7 @@ impl App {
                 self.scanning = false;
                 if self.issues.is_empty() {
                     self.status =
-                        "Inventory ready. Space selects; a requests AI advice; r reviews deletion."
+                        "Inventory ready. p builds a cleanup proposal; Space selects; r reviews deletion."
                             .into();
                 } else {
                     self.status = format!(
@@ -172,6 +231,26 @@ impl App {
                     item.advice = advice;
                     item.reviewing = false;
                 }
+            }
+            Event::Proposal(results) => {
+                self.planning = false;
+                let mut proposed = Vec::new();
+                let total = results.len();
+                for (key, reviews) in results {
+                    if let Some(item) = self.items.iter_mut().find(|i| i.key == key) {
+                        item.reviewing = false;
+                        item.advice = reviews.iter().map(|r| r.text.clone()).collect();
+                        if item.blocked.is_none()
+                            && !reviews.is_empty()
+                            && reviews.iter().all(|r| r.regenerable)
+                        {
+                            proposed.push(item.clone());
+                        }
+                    }
+                }
+                self.status = format!("Draft: {} proposed / {total} reviewed. Other items need investigation; inspect their advice.", proposed.len());
+                self.popup = Some(Popup::Proposal(proposed));
+                self.scroll = 0;
             }
             Event::Finished(key, result) => {
                 self.executing = self.executing.saturating_sub(1);
@@ -296,38 +375,30 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
                     }
                 }
                 KeyCode::Enter => match app.popup.take().unwrap() {
-                    Popup::Ai(items) => {
+                    popup @ (Popup::Ai(_) | Popup::PlanRequest(_)) => {
+                        let proposal = matches!(popup, Popup::PlanRequest(_));
+                        let items = match popup {
+                            Popup::Ai(items) | Popup::PlanRequest(items) => items,
+                            _ => unreachable!(),
+                        };
                         app.scroll = 0;
-                        for item in items {
+                        app.planning = proposal;
+                        for item in &items {
                             if let Some(current) = app.items.iter_mut().find(|i| i.key == item.key)
                             {
                                 current.reviewing = true;
                             }
-                            let tx = tx.clone();
-                            let state = item.evidence(config.days);
-                            let key = item.key;
-                            std::thread::spawn(move || {
-                                let handles: Vec<_> = advice::configured()
-                                    .into_iter()
-                                    .map(|p| {
-                                        let state = state.clone();
-                                        std::thread::spawn(move || advice::review(p, state))
-                                    })
-                                    .collect();
-                                let results = handles
-                                    .into_iter()
-                                    .map(|h| {
-                                        h.join().unwrap_or_else(|_| {
-                                            "Provider failed; UNREVIEWED".into()
-                                        })
-                                    })
-                                    .collect();
-                                let _ = tx.send(Event::Advice(key, results));
-                            });
                         }
-                        app.status =
-                            "Review requested. Advice will appear in the details pane.".into();
+                        start_reviews(
+                            items,
+                            advice::configured(),
+                            config.days,
+                            tx.clone(),
+                            proposal,
+                        );
+                        app.status = "Decision reviews running (four workers). No selection or deletion has been approved.".into();
                     }
+                    Popup::Proposal(items) => app.adopt_proposal(&items),
                     Popup::Delete(items, input) if confirmed(&items, &input) => {
                         app.scroll = 0;
                         app.executing = items.len();
@@ -414,6 +485,23 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
             KeyCode::Char(' ') => app.toggle(),
             KeyCode::PageDown => app.scroll = app.scroll.saturating_add(8),
             KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(8),
+            KeyCode::Char('p') => {
+                if app.planning || app.executing > 0 || app.items.iter().any(|i| i.reviewing) {
+                    app.status = "Wait for pending reviews or cleanup to finish.".into();
+                } else if advice::configured().is_empty() {
+                    app.popup = Some(Popup::Info(advice::SETUP.into()));
+                } else {
+                    let items = app.proposal_candidates();
+                    if items.is_empty() {
+                        app.status = "No eligible path candidates in this view. Local blockers and persistent stores are excluded.".into();
+                    } else if items.len() > 512 {
+                        app.popup = Some(Popup::Info("More than 512 candidates. Narrow the category or search to bound provider costs.".into()));
+                    } else {
+                        app.popup = Some(Popup::PlanRequest(items));
+                    }
+                }
+                app.scroll = 0;
+            }
             KeyCode::Char('a') => {
                 let mut items = app.selected();
                 if items.is_empty() {
@@ -421,8 +509,8 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
                         items.push(app.items[i].clone());
                     }
                 }
-                if items.iter().any(|i| i.reviewing) {
-                    app.status = "Review is already running for a selection.".into();
+                if app.planning || app.executing > 0 || app.items.iter().any(|i| i.reviewing) {
+                    app.status = "Wait for pending reviews or cleanup to finish.".into();
                     continue;
                 }
                 if advice::configured().is_empty() {
@@ -436,7 +524,7 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
             }
             KeyCode::Char('r') => {
                 let items = app.selected();
-                if app.executing > 0 || items.iter().any(|i| i.reviewing) {
+                if app.planning || app.executing > 0 || items.iter().any(|i| i.reviewing) {
                     app.status = "Wait for the pending review or cleanup to finish.".into();
                 } else if items.is_empty() {
                     app.status = "Select an item with Space first.".into();
@@ -446,7 +534,7 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
                 }
             }
             KeyCode::Char('?') => {
-                app.popup = Some(Popup::Info(format!("Inspection issues:\n{}\n\nSpace selects a candidate. Tab changes category. / searches; Esc clears. s changes sorting. PgUp/PgDn scroll details.\n\na requests AI review of selected items, or the highlighted item. You approve metadata sharing first. Models never select or execute cleanup.\n\nr shows exact selections and consequences. Type the requested phrase and press Enter to delete. Esc cancels. Local checks are repeated first. Worktrees use Git without --force; volumes are confirmed individually.\n\nThe scheduled job produces reports only. Sizes can overlap across stores, areas and children. Unknown sizes are not zero. Some processes deny inspection; protect service paths with --exclude or .dev-sweep-keep.\n\nq exits. For privileged storage sizes, run dev-sweep audit --system outside the TUI.", if app.issues.is_empty() { "None reported so far".into() } else {app.issues.join("\n")})));
+                app.popup = Some(Popup::Info(format!("Inspection issues:\n{}\n\nSpace selects a candidate. Tab changes category. / searches; Esc clears. s changes sorting. PgUp/PgDn scroll details.\n\na requests AI review of selected items, or the highlighted item. You approve metadata sharing first. p reviews eligible items in the current view and builds a draft proposal. Enter adopts it; Space removes exceptions. Models never approve or execute cleanup.\n\nr shows exact selections and consequences. Type the requested phrase and press Enter to delete. Esc cancels. Local checks are repeated first. Worktrees use Git without --force; volumes are confirmed individually.\n\nThe scheduled job produces reports only. Sizes can overlap across stores, areas and children. Unknown sizes are not zero. Some processes deny inspection; protect service paths with --exclude or .dev-sweep-keep.\n\nq exits. For privileged storage sizes, run dev-sweep audit --system outside the TUI.", if app.issues.is_empty() { "None reported so far".into() } else {app.issues.join("\n")})));
                 app.scroll = 0;
             }
             _ => {}
@@ -454,6 +542,44 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
     }
     terminal.show_cursor()?;
     Ok(())
+}
+fn start_reviews(
+    items: Vec<Item>,
+    providers: Vec<advice::Provider>,
+    days: u64,
+    tx: mpsc::Sender<Event>,
+    proposal: bool,
+) {
+    std::thread::spawn(move || {
+        let results = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for worker in 0..items.len().min(4) {
+                let items = &items;
+                let providers = &providers;
+                let tx = &tx;
+                let results = &results;
+                scope.spawn(move || {
+                    for item in items.iter().skip(worker).step_by(4) {
+                        let reviews: Vec<_> = providers
+                            .iter()
+                            .map(|p| advice::review(p.clone(), item.decision_evidence(days)))
+                            .collect();
+                        if proposal {
+                            results.lock().unwrap().push((item.key.clone(), reviews));
+                        } else {
+                            let _ = tx.send(Event::Advice(
+                                item.key.clone(),
+                                reviews.into_iter().map(|r| r.text).collect(),
+                            ));
+                        }
+                    }
+                });
+            }
+        });
+        if proposal {
+            let _ = tx.send(Event::Proposal(results.into_inner().unwrap()));
+        }
+    });
 }
 fn safe(text: &str) -> String {
     text.chars()
@@ -712,7 +838,7 @@ fn draw(frame: &mut Frame, app: &App, days: u64) {
             .style(Style::new().fg(WARN)),
         chunks[3],
     );
-    frame.render_widget(Paragraph::new("↑↓ move   Space select   Tab category   / search   a AI review\nr review deletion   s sort   ? help   q quit").style(Style::new().fg(MUTED)),chunks[4]);
+    frame.render_widget(Paragraph::new("↑↓ move   Space select   Tab category   / search   a AI review   p cleanup proposal\nr review deletion   s sort   ? help   q quit").style(Style::new().fg(MUTED)),chunks[4]);
     if let Some(popup) = &app.popup {
         let modal = Rect {
             x: area.x + area.width / 16,
@@ -723,18 +849,40 @@ fn draw(frame: &mut Frame, app: &App, days: u64) {
         frame.render_widget(Clear, modal);
         let (title, text, input) = match popup {
             Popup::Info(s) => (" Help / setup ", s.clone(), None),
-            Popup::Ai(items) => {
+            Popup::Ai(items) | Popup::PlanRequest(items) => {
                 let providers = advice::configured()
                     .into_iter()
                     .map(|p| p.label)
                     .collect::<Vec<_>>()
                     .join(", ");
-                let mut text = format!("Send cleanup metadata for {} item(s) to:\n{}\n\nIncludes paths/names, sizes, category, local blockers, planned action and consequences. File contents and API keys are not included in the prompt. Provider calls may incur charges.\n\nModels give advice only.\n\nMETADATA TO SEND\n",items.len(),providers);
+                let mut text = format!("Send cleanup metadata for {} item(s) to:\n{}\n\nIncludes paths/names, sizes, category, local blockers, planned action and consequences. File contents and API keys are not included in the prompt. Provider calls may incur charges.\n\nUp to four concurrent calls; one per item per provider. Long metadata is refused rather than truncated. No files or selections change. Enter approves metadata sharing only.\n\nMETADATA TO SEND\n",items.len(),providers);
                 for item in items {
-                    text.push_str(&serde_json::to_string_pretty(&item.evidence(days)).unwrap());
+                    text.push_str(
+                        &serde_json::to_string_pretty(&item.decision_evidence(days)).unwrap(),
+                    );
                     text.push_str("\n\n");
                 }
                 (" Request AI safety advice ", text, None)
+            }
+            Popup::Proposal(items) => {
+                let mut text = format!("{}\n\n{} item(s) proposed for your review. Enter REPLACES your current selections with this draft. Esc keeps existing selections. Nothing is deleted. Then remove exceptions with Space and press r for final approval.\n\nModel agreement is not proof of safety. Native stores and volumes require separate manual review.\n\n", app.status, items.len());
+                for item in items {
+                    text.push_str(&format!(
+                        "{} · {}\n{}\n{}\n{}\n\n",
+                        item.label,
+                        item.bytes
+                            .map(human_size)
+                            .unwrap_or_else(|| "Unknown size".into()),
+                        item.location,
+                        item.consequence,
+                        item.advice.join("\n")
+                    ));
+                }
+                (
+                    " Cleanup proposal · Enter adopts / Esc cancels ",
+                    text,
+                    None,
+                )
             }
             Popup::Delete(items, input) => {
                 let mut text = format!("Permanently remove {} selected item(s). There is no undo. Each action is rechecked immediately before execution.\n\n",items.len());
@@ -877,6 +1025,47 @@ mod tests {
             "node_modules: /tmp/project/node_modules"
         );
         assert!(confirmed(&selected, "DELETE 1"));
+    }
+    #[test]
+    fn proposal_requires_adoption_and_excludes_failed_reviews_and_blockers() {
+        let mut app = App::new();
+        let good = item();
+        let mut failed = item();
+        failed.key = "failed".into();
+        failed.scope = Some("/tmp/other/node_modules".into());
+        let mut blocked = item();
+        blocked.key = "blocked".into();
+        blocked.blocked = Some("active".into());
+        let mut store = item();
+        store.key = "store".into();
+        store.action = Action::Store("uv".into());
+        app.items = vec![good, failed, blocked, store];
+        assert_eq!(app.proposal_candidates().len(), 2);
+        let review = |regenerable| advice::Review {
+            text: "fixture".into(),
+            regenerable,
+        };
+        app.accept(Event::Proposal(vec![
+            (app.items[0].key.clone(), vec![review(true)]),
+            ("failed".into(), vec![review(true), review(false)]),
+            ("blocked".into(), vec![review(true)]),
+        ]));
+        assert!(
+            app.selected().is_empty(),
+            "model output cannot adopt selections"
+        );
+        let Some(Popup::Proposal(proposed)) = app.popup.take() else {
+            panic!("missing proposal")
+        };
+        assert_eq!(proposed.len(), 1);
+        app.adopt_proposal(&proposed);
+        assert_eq!(app.selected().len(), 1);
+        assert!(confirmed(&app.selected(), "DELETE 1"));
+        app.adopt_proposal(&[]);
+        assert_eq!(app.selected().len(), 1);
+        app.items[0].blocked = Some("changed".into());
+        app.adopt_proposal(&proposed);
+        assert!(app.selected().is_empty());
     }
     #[test]
     fn terminal_layout_shows_risk_and_handles_small_screens() {

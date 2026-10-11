@@ -57,6 +57,16 @@ impl Item {
         }
     }
 
+    pub fn decision_evidence(&self, days: u64) -> serde_json::Value {
+        let mut state = self.evidence(days);
+        state
+            .as_object_mut()
+            .unwrap()
+            .remove("included_generated_artifacts");
+        state["included_generated_count"] = serde_json::json!(self.included.len());
+        state
+    }
+
     pub fn evidence(&self, days: u64) -> serde_json::Value {
         serde_json::json!({"label":self.label,"path_or_name":self.location,
             "resolved_cleanup_scope":self.scope.as_ref().map(|p|format!("{p:?}")),
@@ -79,6 +89,7 @@ pub enum Event {
     Issue(String),
     Done,
     Advice(String, Vec<String>),
+    Proposal(Vec<(String, Vec<crate::advice::Review>)>),
     Finished(String, std::result::Result<String, String>),
 }
 

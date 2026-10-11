@@ -76,19 +76,28 @@ source ~/.config/dev-sweep/secrets.env
 
 You can put the `source` line in your `~/.bashrc` if you want it loaded in every Bash session. Keep the secrets file outside the repository. The daily report does not need a key.
 
-OpenRouter uses `openai/gpt-4.1-mini` by default. Set `OPENROUTER_MODEL` to the model ID you want to use.
+OpenRouter defaults to `cloudflare/clef` through its Decisions API. Your existing `OPENROUTER_API_KEY` works for Clef and Jev; separate provider keys are optional. Remove any old `OPENROUTER_MODEL=openai/gpt-4.1-mini` override. Chat models are no longer used.
 
-Press `a` in the TUI to request a review. A dialog shows the paths, sizes, checks, and planned actions before you approve sending them. File contents are not sent. Requests may cost money. Models advise; they cannot select files, approve deletion, or override a failed local check.
+```bash
+# Optional alternative decision model:
+export OPENROUTER_MODEL=typesafe/jev-1.13
+```
 
-Clef and Jev use separate integrations. An OpenRouter key enables the OpenRouter review only.
+Press **p** to build a cleanup proposal for eligible items in the current category and search. No manual selection is needed first. The dialog shows exactly which metadata will be sent; Enter approves those requests. There are at most four concurrent requests, one per item per configured provider, with a 512-item limit per proposal. Narrow the view for smaller batches. Requests may cost money.
+
+When reviews finish, the draft lists proposed items and their consequences. Enter adopts the draft, replacing your current selections; Esc keeps them. Remove exceptions with Space, then press **r** and type the exact deletion confirmation. Nothing is removed by generating or adopting a proposal. Newly discovered items are not added to an existing draft.
+
+Blocked candidates, native store cleanup, and Docker volumes are excluded from bulk proposals. Worktrees take precedence over their nested build artifacts. Failed reviews, tied choices, and provider disagreements stay out of the proposal. Their advice remains in the details pane. Press **a** to review a highlighted item or up to eight manual selections.
 
 | Provider | Environment variables |
 | --- | --- |
-| OpenRouter | `OPENROUTER_API_KEY`, optional `OPENROUTER_MODEL` |
-| Cloudflare Clef | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, optional `DEV_SWEEP_CLEF_MODEL` set to `clef` or `clef-flash` |
-| TypeSafe Jev | `TYPESAFE_API_KEY`, optional `TYPESAFE_MODEL`, default `jev-latest` |
+| OpenRouter Decisions | `OPENROUTER_API_KEY`, optional `OPENROUTER_MODEL`, default `cloudflare/clef` |
+| Direct Cloudflare Clef | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, optional `DEV_SWEEP_CLEF_MODEL` set to `clef` or `clef-flash` |
+| Direct TypeSafe Jev | `TYPESAFE_API_KEY`, optional `TYPESAFE_MODEL`, default `jev-latest` |
 
-Clef defaults to `clef-flash`. Clef and Jev return a choice among `regenerable`, `investigate`, and `retain`, with confidence and probabilities. OpenRouter returns advice and warnings. Disagreement is a reason to inspect the files yourself. Model confidence does not prove deletion is safe. Failed requests leave the item unreviewed.
+All integrations return a typed choice among `regenerable`, `investigate`, and `retain`, with probabilities. Model confidence does not prove deletion is safe. Local checks cannot be overridden, and they run again before removal. File contents and keys are never included in model input. Long metadata is refused rather than silently truncated.
+
+See [decision-model research](docs/decision-models.md) for the API, model tradeoffs, and evaluation limits.
 
 ## Choose folders and age
 
