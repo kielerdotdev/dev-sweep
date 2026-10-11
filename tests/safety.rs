@@ -447,7 +447,7 @@ fn global_cache_entries_obey_age_markers_and_symlink_protection() {
         .output()
         .unwrap();
     success(&result);
-    assert!(!home.join(".npm/_npx/old").exists());
+    assert!(home.join(".npm/_npx/old/node_modules/file").exists());
     assert!(!home
         .join(".vscode-server/data/CachedExtensionVSIXs/old.vsix")
         .exists());
@@ -460,14 +460,14 @@ fn global_cache_entries_obey_age_markers_and_symlink_protection() {
 #[test]
 fn native_package_cleanup_uses_resolved_cache_paths_and_honors_exclusions() {
     let f = Fixture::new();
-    let cache = f.0.join("custom npm cache");
+    let cache = f.0.join("custom uv cache");
     fs::create_dir(&cache).unwrap();
-    let script = f.file("bin/npm", "#!/bin/sh\nif [ \"$1\" = config ]; then printf '%s\\n' \"$DEV_SWEEP_TEST_CACHE\"; else printf '%s\\n' \"$*\" >> \"$DEV_SWEEP_TEST_LOG\"; fi\n");
+    let script = f.file("bin/uv", "#!/bin/sh\nif [ \"$2\" = dir ]; then printf '%s\\n' \"$DEV_SWEEP_TEST_CACHE\"; else printf '%s\\n' \"$*\" >> \"$DEV_SWEEP_TEST_LOG\"; fi\n");
     fs::set_permissions(script, fs::Permissions::from_mode(0o755)).unwrap();
     let log = f.0.join("calls");
     let run = |apply: bool| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_dev-sweep"));
-        cmd.args(["clean-store", "npm", "--config"])
+        cmd.args(["clean-store", "uv", "--config"])
             .arg(f.0.join("config"))
             .env("HOME", f.0.join("home"))
             .env("PATH", f.0.join("bin"))
@@ -481,7 +481,7 @@ fn native_package_cleanup_uses_resolved_cache_paths_and_honors_exclusions() {
     success(&run(false));
     assert!(!log.exists());
     success(&run(true));
-    assert_eq!(fs::read_to_string(&log).unwrap(), "cache clean --force\n");
+    assert_eq!(fs::read_to_string(&log).unwrap(), "cache prune\n");
     fs::remove_file(&log).unwrap();
     f.file(
         "config",
@@ -499,30 +499,27 @@ fn native_package_cleanup_uses_resolved_cache_paths_and_honors_exclusions() {
 }
 
 #[test]
-fn bun_global_cache_commands_work_outside_a_node_project() {
+fn global_node_cache_cleanup_is_disabled_even_with_apply() {
     let f = Fixture::new();
-    let cache = f.0.join("bun-cache");
-    fs::create_dir(&cache).unwrap();
-    let script = f.file("bin/bun", "#!/bin/sh\ntest -f package.json || exit 23\nif [ \"$3\" = rm ]; then printf 'clear\\n' >> \"$DEV_SWEEP_TEST_LOG\"; else printf '%s\\n' \"$DEV_SWEEP_TEST_CACHE\"; fi\n");
-    fs::set_permissions(script, fs::Permissions::from_mode(0o755)).unwrap();
-    let log = f.0.join("calls");
-    for apply in [false, true] {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dev-sweep"));
-        cmd.args(["clean-store", "bun", "--config"])
-            .arg(f.0.join("config"))
-            .env("HOME", f.0.join("home"))
-            .env("PATH", f.0.join("bin"))
-            .env("DEV_SWEEP_TEST_CACHE", &cache)
-            .env("DEV_SWEEP_TEST_LOG", &log)
-            .current_dir(&f.0);
-        if apply {
-            cmd.arg("--apply");
+    for name in ["npm", "npm-unused", "bun", "pnpm"] {
+        let script = f.file(
+            &format!("bin/{name}"),
+            "#!/bin/sh\necho called >> \"$DEV_SWEEP_TEST_LOG\"\n",
+        );
+        fs::set_permissions(script, fs::Permissions::from_mode(0o755)).unwrap();
+        for apply in [false, true] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_dev-sweep"));
+            cmd.args(["clean-store", name, "--config"])
+                .arg(f.0.join("config"))
+                .env("PATH", f.0.join("bin"))
+                .env("DEV_SWEEP_TEST_LOG", f.0.join("calls"));
+            if apply {
+                cmd.arg("--apply");
+            }
+            assert!(!cmd.output().unwrap().status.success());
+            assert!(!f.0.join("calls").exists(), "must not invoke {name}");
         }
-        success(&cmd.output().unwrap());
-        assert_eq!(log.exists(), apply);
-        assert!(!f.0.join("package.json").exists());
     }
-    assert_eq!(fs::read_to_string(log).unwrap(), "clear\n");
 }
 
 #[test]
@@ -670,4 +667,50 @@ fn worktree_removal_includes_generated_caches_but_preserves_unknown_data() {
     assert_eq!(fs::read_to_string(outside).unwrap(), "must survive");
     assert!(repo.join("source").exists());
     git(&repo, &["show-ref", "--verify", "refs/heads/bundled"]);
+}
+
+#[test]
+fn broad_scans_preserve_global_node_paths_and_clean_project_dependencies() {
+    let f = Fixture::new();
+    let home = f.0.join("home");
+    let protected = [
+        ".npm/project",
+        ".bun/install/cache/project",
+        ".local/share/pnpm/store/project",
+        "custom-npm/project",
+        "custom-pnpm/project",
+        "custom-bun/project",
+    ];
+    for project in protected.iter().copied().chain(["projects/local"]) {
+        f.file(&format!("home/{project}/package.json"), "{}");
+        f.file(
+            &format!("home/{project}/node_modules/dependency"),
+            "generated",
+        );
+    }
+    age(&home);
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-sweep"))
+        .args([
+            "clean",
+            "--apply",
+            "--no-docker",
+            "--no-global-caches",
+            "--root",
+        ])
+        .arg(&home)
+        .arg("--config")
+        .arg(f.0.join("config"))
+        .env("HOME", &home)
+        .env("npm_config_cache", home.join("custom-npm"))
+        .env("PNPM_HOME", home.join("custom-pnpm"))
+        .env("BUN_INSTALL", home.join("custom-bun"))
+        .current_dir(std::env::temp_dir())
+        .output()
+        .unwrap();
+    success(&output);
+    for project in protected {
+        assert!(home.join(project).join("node_modules/dependency").exists());
+    }
+    assert!(!home.join("projects/local/node_modules").exists());
+    assert!(home.join("projects/local/package.json").exists());
 }

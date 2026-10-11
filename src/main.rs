@@ -32,7 +32,7 @@ Usage: dev-sweep [tui|scan|audit|clean|init|clean-store STORE|remove-worktree PA
   clean-store STORE       Preview a native store cleanup (use --apply to run)
   remove-volume NAME      Preview one unused Docker volume (use --apply to remove)
 
-Stores: npm, npm-unused, bun, pnpm, uv, nix, docker-build, apt, journal
+Stores: uv, nix, docker-build, apt, journal
 
 Options:
   --apply                 Actually delete (clean/remove-worktree only)
@@ -130,6 +130,53 @@ impl Config {
             }
             if root.parent().is_none() && !allow_root {
                 return Err("refusing to scan filesystem root".into());
+            }
+        }
+        let home = PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?);
+        self.excludes.extend(
+            [
+                ".npm",
+                ".bun",
+                ".local/share/pnpm",
+                ".cache/pnpm",
+                ".cache/node/corepack",
+                ".local/lib/node_modules",
+                ".pnpm-store",
+                ".nvm",
+                ".volta",
+                ".fnm",
+                ".local/share/fnm",
+            ]
+            .map(|p| home.join(p)),
+        );
+        self.excludes.extend([
+            PathBuf::from("/usr/local/lib/node_modules"),
+            PathBuf::from("/usr/lib/node_modules"),
+        ]);
+        for key in ["XDG_CACHE_HOME", "XDG_DATA_HOME"] {
+            if let Some(value) = env::var_os(key).filter(|v| !v.is_empty()) {
+                let path = PathBuf::from(value).join("pnpm");
+                if path.is_absolute() {
+                    self.excludes.push(path);
+                }
+            }
+        }
+        for key in [
+            "npm_config_cache",
+            "NPM_CONFIG_CACHE",
+            "npm_config_prefix",
+            "NPM_CONFIG_PREFIX",
+            "PNPM_HOME",
+            "BUN_INSTALL",
+            "BUN_INSTALL_CACHE_DIR",
+        ] {
+            if let Some(value) = env::var_os(key).filter(|v| !v.is_empty()) {
+                let path = PathBuf::from(value);
+                self.excludes.push(if path.is_absolute() {
+                    path
+                } else {
+                    env::current_dir()?.join(path)
+                });
             }
         }
         // Protect both a symlink's location and its resolved path.
@@ -793,7 +840,7 @@ fn sweep(config: &Config, busy: &[PathBuf], apply: bool) -> Result<()> {
             eprintln!("Global caches: {error}");
             errors += 1;
         }
-        for name in ["npm-unused", "pnpm", "uv", "nix"] {
+        for name in ["uv", "nix"] {
             if let Err(error) = stores::clean_store(name, config, &home, apply) {
                 eprintln!("{name}: {error}");
                 errors += 1;

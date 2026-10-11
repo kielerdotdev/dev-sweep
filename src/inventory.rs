@@ -345,9 +345,6 @@ fn scan_stores(config: &Config, home: &Path, tx: &Sender<Event>) -> Result<()> {
     // Managers and large retained areas are visible even when age policy keeps them.
     if config.global_caches {
         for (name,label,consequence) in [
-            ("bun","Bun package cache","Clears the entire resolved Bun cache, regardless of age. Downloads will be needed again."),
-            ("npm","npm package cache","Clears the entire resolved npm cache, regardless of age. Offline installs can fail."),
-            ("pnpm","pnpm store","Runs pnpm store prune. The manager removes unused packages; reinstalling may download them again."),
             ("uv","uv cache","Runs uv cache prune. The manager removes unused entries."),
             ("nix","Nix unreachable store paths","Runs nix-store --gc. Only paths unreachable from GC roots are removed. Generations are preserved."),
             ("apt","APT download cache","Runs sudo -n apt-get clean. Removes package downloads, requires existing sudo authorization."),

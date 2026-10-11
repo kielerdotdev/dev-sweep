@@ -67,12 +67,6 @@ fn capture_inner(
     let stdout = fs::File::create(dir.join("stdout"))?;
     let stderr = fs::File::create(dir.join("stderr"))?;
     let mut command = Command::new(executable(program).unwrap_or_else(|| PathBuf::from(program)));
-    if program == "bun" {
-        // Bun's global-cache command currently requires a package manifest.
-        // Use an empty private workspace without touching the caller's project.
-        fs::write(dir.join("package.json"), b"{}\n")?;
-        command.current_dir(&dir);
-    }
     let mut child = command
         .args(args)
         .stdin(Stdio::null())
@@ -204,30 +198,11 @@ pub fn store_plan(name: &str, config: &Config, home: &Path) -> Result<StorePlan>
             None,
             None,
         ),
-        "npm" => (
-            "npm",
-            strings(&["cache", "clean", "--force"]),
-            Some(home.join(".npm")),
-            Some(strings(&["config", "get", "cache"])),
-        ),
-        "npm-unused" => (
-            "npm",
-            strings(&["cache", "verify"]),
-            Some(home.join(".npm")),
-            Some(strings(&["config", "get", "cache"])),
-        ),
-        "bun" => (
-            "bun",
-            strings(&["pm", "cache", "rm"]),
-            Some(home.join(".bun/install/cache")),
-            Some(strings(&["pm", "cache"])),
-        ),
-        "pnpm" => (
-            "pnpm",
-            strings(&["store", "prune"]),
-            Some(home.join(".local/share/pnpm/store")),
-            Some(strings(&["store", "path", "--silent"])),
-        ),
+        "npm" | "npm-unused" | "bun" | "pnpm" => {
+            return Err(
+                "Global npm, Bun and pnpm caches are protected; cleanup is disabled".into(),
+            );
+        }
         "uv" => (
             "uv",
             strings(&["cache", "prune"]),
@@ -376,18 +351,9 @@ pub fn global_roots(home: &Path) -> Vec<PathBuf> {
     // Only these reproducible per-entry caches are removed directly.
     // Package databases, toolchains, Android images and application history use review/native commands.
     let mut roots = vec![
-        home.join(".npm/_npx"),
-        home.join(".npm/_logs"),
         home.join(".vscode-server/data/CachedExtensionVSIXs"),
         home.join(".cursor-server/data/CachedExtensionVSIXs"),
     ];
-    if let Some(cache) = env::var_os("npm_config_cache").or_else(|| env::var_os("NPM_CONFIG_CACHE"))
-    {
-        roots.extend([
-            PathBuf::from(&cache).join("_npx"),
-            PathBuf::from(cache).join("_logs"),
-        ]);
-    }
     roots.sort();
     roots.dedup();
     roots
