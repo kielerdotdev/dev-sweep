@@ -6,7 +6,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{prelude::*, widgets::*};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
+use std::time::Instant;
 const INK: Color = Color::Rgb(220, 230, 238);
 const MUTED: Color = Color::Rgb(142, 161, 176);
 const ACCENT: Color = Color::Rgb(108, 211, 200);
@@ -22,11 +26,29 @@ const FILTERS: [&str; 7] = [
     "Retained",
     "Selected",
 ];
+#[derive(Clone, Default)]
+struct PlanReport {
+    proposed: Vec<Item>,
+    deferred: Vec<Item>,
+    reviewed: usize,
+    failed: usize,
+}
+impl PlanReport {
+    fn chosen(&self) -> Vec<Item> {
+        self.proposed
+            .iter()
+            .filter(|i| i.selected)
+            .cloned()
+            .collect()
+    }
+}
 enum Popup {
     Info(String),
     Ai(Vec<Item>),
     PlanRequest(Vec<Item>),
-    Proposal(Vec<Item>),
+    Metadata { items: Vec<Item>, proposal: bool },
+    NoCandidates(String),
+    Proposal { report: PlanReport, deferred: bool },
     Delete(Vec<Item>, String),
 }
 struct App {
@@ -38,6 +60,19 @@ struct App {
     scanning: bool,
     executing: usize,
     planning: bool,
+    queued_plan: bool,
+    providers: Vec<advice::Provider>,
+    review_done: usize,
+    review_total: usize,
+    review_errors: usize,
+    review_started: Option<Instant>,
+    review_cancel: Option<Arc<AtomicBool>>,
+    review_cancelled: bool,
+    report: Option<PlanReport>,
+    popup_cursor: usize,
+    plan_confirmation: String,
+    plan_error: String,
+    scan_status: String,
     status: String,
     popup: Option<Popup>,
     scroll: u16,
@@ -57,7 +92,20 @@ impl App {
             scanning: true,
             executing: 0,
             planning: false,
-            status: "Reading storage inventory".into(),
+            queued_plan: false,
+            providers: Vec::new(),
+            review_done: 0,
+            review_total: 0,
+            review_errors: 0,
+            review_started: None,
+            review_cancel: None,
+            review_cancelled: false,
+            report: None,
+            popup_cursor: 0,
+            plan_confirmation: String::new(),
+            plan_error: String::new(),
+            scan_status: "Discovering projects and worktrees".into(),
+            status: "Press Enter or p to build a cleanup plan.".into(),
             popup: None,
             scroll: 0,
             size_sort: true,
@@ -68,6 +116,12 @@ impl App {
     }
     fn visible(&self) -> Vec<usize> {
         let query = self.query.to_lowercase();
+        let retained_worktrees: HashSet<_> = self
+            .items
+            .iter()
+            .filter(|i| matches!(i.action, Action::Worktree(_)) && i.blocked.is_some())
+            .filter_map(|i| i.scope.as_deref())
+            .collect();
         let mut rows: Vec<_> = self
             .items
             .iter()
@@ -76,7 +130,12 @@ impl App {
                 (self.filter == 0
                     || FILTERS[self.filter] == item.group
                     || self.filter == 6 && item.selected)
-                    && (self.filter != 0 || item.parent_worktree.is_none() || item.selected)
+                    && (self.filter != 0
+                        || item.parent_worktree.is_none()
+                        || item.selected
+                        || item.parent_worktree.as_ref().is_some_and(|parent| {
+                            item.blocked.is_none() && retained_worktrees.contains(parent.as_path())
+                        }))
                     && format!(
                         "{} {} {}",
                         item.label,
@@ -134,6 +193,64 @@ impl App {
             }
         }
         result
+    }
+    fn begin_plan(&mut self, fresh: bool) {
+        self.scroll = 0;
+        self.popup_cursor = 0;
+        self.plan_confirmation.clear();
+        self.plan_error.clear();
+        self.queued_plan = false;
+        if self.planning {
+            self.popup = Some(Popup::Info(format!("AI review is running: {} / {} complete.\n\nBrowse the inventory while reviews finish. Press Esc in the inventory to stop further requests. Nothing is selected or deleted.", self.review_done, self.review_total)));
+        } else if self.executing > 0 || self.items.iter().any(|i| i.reviewing) {
+            self.popup = Some(Popup::Info(
+                "Wait for the current review or cleanup to finish. Nothing else was started."
+                    .into(),
+            ));
+        } else if !fresh && self.report.is_some() {
+            self.popup = Some(Popup::Proposal {
+                report: self.report.clone().unwrap(),
+                deferred: false,
+            });
+        } else if self.providers.is_empty() {
+            self.popup = Some(Popup::Info(advice::SETUP.into()));
+        } else {
+            let items = self.proposal_candidates();
+            if items.is_empty() {
+                let mut reasons = std::collections::BTreeMap::new();
+                for i in self.visible() {
+                    if let Some(reason) = &self.items[i].blocked {
+                        *reasons.entry(reason.clone()).or_insert(0usize) += 1;
+                    }
+                }
+                let mut text = format!("No eligible cleanup candidates in this view yet.\n\n{} inspected items. Retained worktrees can still contain eligible caches; those appear as inspection finishes.\n\n", self.visible().len());
+                for (reason, count) in reasons {
+                    text.push_str(&format!("{count} retained: {reason}\n"));
+                }
+                text.push_str(if self.scanning { "\nThe scan is still running. Enter waits for the remaining inventory, then opens the metadata approval. No model requests start while waiting." } else { "\nThe scan is complete. Try All or Caches, or clear search with Esc. The AI cannot override age, Git, process or path protection checks. Native stores and Docker volumes require separate manual review. No files or selections changed." });
+                self.popup = Some(Popup::NoCandidates(text));
+            } else if items.len() > 512 {
+                self.popup = Some(Popup::Info("More than 512 candidates. Use a category or search to reduce provider calls, then press p again.".into()));
+            } else {
+                self.popup = Some(Popup::PlanRequest(items));
+            }
+        }
+    }
+    fn review_progress(&self) -> String {
+        format!(
+            "{}: {} / {} complete | {} failed | {}s elapsed. No deletion approved.",
+            if self.review_cancelled {
+                "Stopping AI review; finishing in-flight requests"
+            } else {
+                "AI review"
+            },
+            self.review_done,
+            self.review_total,
+            self.review_errors,
+            self.review_started
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0)
+        )
     }
     fn adopt_proposal(&mut self, proposed: &[Item]) {
         if proposed.is_empty() {
@@ -208,49 +325,76 @@ impl App {
                 used_percent,
             } => self.disk = Some((available, used_percent)),
             Event::Item(item) => self.items.push(*item),
-            Event::Status(s) => self.status = s,
+            Event::Status(s) => self.scan_status = s,
             Event::Issue(s) => {
-                self.status = s.clone();
+                self.scan_status = s.clone();
                 self.issues.push(s);
             }
             Event::Done => {
                 self.scanning = false;
-                if self.issues.is_empty() {
-                    self.status =
-                        "Inventory ready. p builds a cleanup proposal; Space selects; r reviews deletion."
-                            .into();
-                } else {
-                    self.status = format!(
-                        "Inventory has {} inspection issues. Press ? for details.",
-                        self.issues.len()
-                    );
+                self.scan_status = format!(
+                    "Inventory complete · {} inspection issues",
+                    self.issues.len()
+                );
+                if self.queued_plan && self.popup.is_none() && self.executing == 0 {
+                    self.queued_plan = false;
+                    self.begin_plan(true);
                 }
             }
-            Event::Advice(key, advice) => {
+            Event::ReviewProgress { key, reviews } => {
+                self.review_done += 1;
+                if reviews.iter().any(|r| r.failed) {
+                    self.review_errors += 1;
+                }
                 if let Some(item) = self.items.iter_mut().find(|i| i.key == key) {
-                    item.advice = advice;
+                    item.advice = reviews.iter().map(|r| r.text.clone()).collect();
                     item.reviewing = false;
+                }
+                if !self.planning && self.review_done >= self.review_total {
+                    self.review_cancel = None;
+                    self.status = "AI review finished. Results are in the details pane; p builds a cleanup plan.".into();
                 }
             }
             Event::Proposal(results) => {
                 self.planning = false;
-                let mut proposed = Vec::new();
-                let total = results.len();
+                self.review_cancel = None;
+                let mut report = PlanReport {
+                    reviewed: results.len(),
+                    ..PlanReport::default()
+                };
                 for (key, reviews) in results {
                     if let Some(item) = self.items.iter_mut().find(|i| i.key == key) {
                         item.reviewing = false;
                         item.advice = reviews.iter().map(|r| r.text.clone()).collect();
+                        let failed = reviews.is_empty() || reviews.iter().any(|r| r.failed);
+                        if failed {
+                            report.failed += 1;
+                        }
                         if item.blocked.is_none()
                             && !reviews.is_empty()
                             && reviews.iter().all(|r| r.regenerable)
                         {
-                            proposed.push(item.clone());
+                            let mut draft = item.clone();
+                            draft.selected = true;
+                            report.proposed.push(draft);
+                        } else {
+                            report.deferred.push(item.clone());
                         }
                     }
                 }
-                self.status = format!("Draft: {} proposed / {total} reviewed. Other items need investigation; inspect their advice.", proposed.len());
-                self.popup = Some(Popup::Proposal(proposed));
+                report
+                    .proposed
+                    .sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.key.cmp(&b.key)));
+                self.status = format!("AI review complete: {} proposed, {} need review, {} failed. Enter opens the plan; n starts a new review.", report.proposed.len(), report.deferred.len(), report.failed);
+                self.report = Some(report.clone());
+                if !self.review_cancelled {
+                    self.popup = Some(Popup::Proposal {
+                        report,
+                        deferred: false,
+                    });
+                }
                 self.scroll = 0;
+                self.popup_cursor = 0;
             }
             Event::Finished(key, result) => {
                 self.executing = self.executing.saturating_sub(1);
@@ -309,6 +453,13 @@ impl Drop for Restore {
     }
 }
 pub fn run(config: Config, home: PathBuf) -> Result<()> {
+    run_with_providers(config, home, advice::configured())
+}
+fn run_with_providers(
+    config: Config,
+    home: PathBuf,
+    providers: Vec<advice::Provider>,
+) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("The TUI needs an interactive terminal. Use scan or audit for reports.".into());
     }
@@ -325,9 +476,18 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let _scan = inventory::start(config.clone(), home.clone(), tx.clone());
     let mut app = App::new();
+    app.providers = providers;
     loop {
         while let Ok(event) = rx.try_recv() {
             app.accept(event);
+        }
+        if app.queued_plan
+            && !app.scanning
+            && app.popup.is_none()
+            && app.executing == 0
+            && app.review_cancel.is_none()
+        {
+            app.begin_plan(true);
         }
         terminal.draw(|frame| draw(frame, &app, config.days))?;
         app.tick += 1;
@@ -359,7 +519,102 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
         if app.popup.is_some() {
             match key.code {
                 KeyCode::Esc => {
+                    if let Some(Popup::Proposal { report, .. }) = &app.popup {
+                        app.report = Some(report.clone());
+                    }
                     app.popup = None;
+                    app.scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Up
+                    if matches!(app.popup, Some(Popup::Proposal { .. })) =>
+                {
+                    if let Some(Popup::Proposal { report, deferred }) = &app.popup {
+                        let len = if *deferred {
+                            report.deferred.len()
+                        } else {
+                            report.proposed.len()
+                        };
+                        app.popup_cursor = if key.code == KeyCode::Down {
+                            (app.popup_cursor + 1).min(len.saturating_sub(1))
+                        } else {
+                            app.popup_cursor.saturating_sub(1)
+                        };
+                        app.scroll = 0;
+                    }
+                }
+                KeyCode::Tab if matches!(app.popup, Some(Popup::Proposal { .. })) => {
+                    if let Some(Popup::Proposal { deferred, .. }) = &mut app.popup {
+                        *deferred = !*deferred;
+                    }
+                    app.popup_cursor = 0;
+                    app.scroll = 0;
+                }
+                KeyCode::Char(' ')
+                    if matches!(app.popup, Some(Popup::Proposal { .. }))
+                        && app.plan_confirmation != "DELETE" =>
+                {
+                    if let Some(Popup::Proposal {
+                        report,
+                        deferred: false,
+                    }) = &mut app.popup
+                    {
+                        if let Some(item) = report.proposed.get_mut(app.popup_cursor) {
+                            item.selected = !item.selected;
+                        }
+                    }
+                    app.plan_confirmation.clear();
+                    app.plan_error.clear();
+                }
+                KeyCode::Char(c)
+                    if matches!(app.popup, Some(Popup::Proposal { .. }))
+                        && (!app.plan_confirmation.is_empty() || c == 'D') =>
+                {
+                    app.plan_confirmation.push(c);
+                    app.plan_error.clear();
+                }
+                KeyCode::Backspace if matches!(app.popup, Some(Popup::Proposal { .. })) => {
+                    app.plan_confirmation.pop();
+                    app.plan_error.clear();
+                }
+                KeyCode::Char(' ') if matches!(app.popup, Some(Popup::Proposal { .. })) => {
+                    if let Some(Popup::Proposal {
+                        report,
+                        deferred: false,
+                    }) = &mut app.popup
+                    {
+                        if let Some(item) = report.proposed.get_mut(app.popup_cursor) {
+                            item.selected = !item.selected;
+                        }
+                    }
+                }
+                KeyCode::Char('n') if matches!(app.popup, Some(Popup::Proposal { .. })) => {
+                    app.begin_plan(true)
+                }
+                KeyCode::Char('m')
+                    if matches!(
+                        app.popup,
+                        Some(Popup::Ai(_) | Popup::PlanRequest(_) | Popup::Metadata { .. })
+                    ) =>
+                {
+                    app.popup = Some(match app.popup.take().unwrap() {
+                        Popup::Ai(items) => Popup::Metadata {
+                            items,
+                            proposal: false,
+                        },
+                        Popup::PlanRequest(items) => Popup::Metadata {
+                            items,
+                            proposal: true,
+                        },
+                        Popup::Metadata {
+                            items,
+                            proposal: true,
+                        } => Popup::PlanRequest(items),
+                        Popup::Metadata {
+                            items,
+                            proposal: false,
+                        } => Popup::Ai(items),
+                        _ => unreachable!(),
+                    });
                     app.scroll = 0;
                 }
                 KeyCode::PageDown | KeyCode::Down => app.scroll = app.scroll.saturating_add(5),
@@ -375,44 +630,79 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
                     }
                 }
                 KeyCode::Enter => match app.popup.take().unwrap() {
-                    popup @ (Popup::Ai(_) | Popup::PlanRequest(_)) => {
-                        let proposal = matches!(popup, Popup::PlanRequest(_));
+                    popup @ (Popup::Ai(_) | Popup::PlanRequest(_) | Popup::Metadata { .. }) => {
+                        let proposal = matches!(
+                            popup,
+                            Popup::PlanRequest(_) | Popup::Metadata { proposal: true, .. }
+                        );
                         let items = match popup {
-                            Popup::Ai(items) | Popup::PlanRequest(items) => items,
+                            Popup::Ai(items)
+                            | Popup::PlanRequest(items)
+                            | Popup::Metadata { items, .. } => items,
                             _ => unreachable!(),
                         };
                         app.scroll = 0;
                         app.planning = proposal;
+                        app.review_done = 0;
+                        app.review_total = items.len();
+                        app.review_errors = 0;
+                        app.review_started = Some(Instant::now());
+                        app.review_cancelled = false;
                         for item in &items {
                             if let Some(current) = app.items.iter_mut().find(|i| i.key == item.key)
                             {
                                 current.reviewing = true;
                             }
                         }
-                        start_reviews(
+                        app.review_cancel = Some(start_reviews(
                             items,
-                            advice::configured(),
+                            app.providers.clone(),
                             config.days,
                             tx.clone(),
                             proposal,
-                        );
+                        ));
                         app.status = "Decision reviews running (four workers). No selection or deletion has been approved.".into();
                     }
-                    Popup::Proposal(items) => app.adopt_proposal(&items),
-                    Popup::Delete(items, input) if confirmed(&items, &input) => {
+                    Popup::Proposal { report, deferred } => {
+                        let chosen = report.chosen();
+                        app.report = Some(report.clone());
+                        if confirmed(&chosen, &app.plan_confirmation) {
+                            app.adopt_proposal(&chosen);
+                            begin_cleanup(&mut app, chosen, &config, &home, &tx);
+                            app.plan_confirmation.clear();
+                        } else {
+                            app.plan_error = if chosen.is_empty() {
+                                "No files checked. Nothing deleted.".into()
+                            } else {
+                                format!(
+                                    "Nothing deleted. Enter the exact phrase {}.",
+                                    phrase(&chosen)
+                                )
+                            };
+                            app.status = if chosen.is_empty() {
+                                "No files chosen. Tab shows review outcomes; n starts a new plan."
+                                    .into()
+                            } else {
+                                format!("Nothing deleted. Type {} and press Enter to approve these exact files.", phrase(&chosen))
+                            };
+                            app.popup = Some(Popup::Proposal { report, deferred });
+                        }
+                    }
+                    Popup::NoCandidates(_) => {
+                        if app.scanning {
+                            app.queued_plan = true;
+                            app.status = "Waiting for remaining inventory. A metadata approval will open when the scan finishes.".into();
+                        } else {
+                            app.filter = 0;
+                            app.query.clear();
+                            app.cursor = 0;
+                            app.status =
+                                "Showing All. Age and protection checks remain in force.".into();
+                        }
                         app.scroll = 0;
-                        app.executing = items.len();
-                        app.status = "Rechecking each selection before removal".into();
-                        let tx = tx.clone();
-                        let config = config.clone();
-                        let home = home.clone();
-                        std::thread::spawn(move || {
-                            for item in items {
-                                let result = inventory::execute(&item, &config, &home)
-                                    .map_err(|e| e.to_string());
-                                let _ = tx.send(Event::Finished(item.key, result));
-                            }
-                        });
+                    }
+                    Popup::Delete(items, input) if confirmed(&items, &input) => {
+                        begin_cleanup(&mut app, items, &config, &home, &tx);
                     }
                     Popup::Delete(items, input) => {
                         app.status = "Confirmation does not match. Nothing deleted.".into();
@@ -475,6 +765,12 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
             }
             KeyCode::Char('/') => app.searching = true,
             KeyCode::Esc => {
+                if let Some(cancel) = &app.review_cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                    app.review_cancelled = true;
+                    app.status = "Stopping further AI requests. Waiting for in-flight requests to finish; no deletion approved.".into();
+                }
+                app.queued_plan = false;
                 app.query.clear();
                 app.cursor = 0;
             }
@@ -485,24 +781,10 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
             KeyCode::Char(' ') => app.toggle(),
             KeyCode::PageDown => app.scroll = app.scroll.saturating_add(8),
             KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(8),
-            KeyCode::Char('p') => {
-                if app.planning || app.executing > 0 || app.items.iter().any(|i| i.reviewing) {
-                    app.status = "Wait for pending reviews or cleanup to finish.".into();
-                } else if advice::configured().is_empty() {
-                    app.popup = Some(Popup::Info(advice::SETUP.into()));
-                } else {
-                    let items = app.proposal_candidates();
-                    if items.is_empty() {
-                        app.status = "No eligible path candidates in this view. Local blockers and persistent stores are excluded.".into();
-                    } else if items.len() > 512 {
-                        app.popup = Some(Popup::Info("More than 512 candidates. Narrow the category or search to bound provider costs.".into()));
-                    } else {
-                        app.popup = Some(Popup::PlanRequest(items));
-                    }
-                }
-                app.scroll = 0;
-            }
+            KeyCode::Char('p') | KeyCode::Enter => app.begin_plan(false),
+            KeyCode::Char('n') => app.begin_plan(true),
             KeyCode::Char('a') => {
+                app.queued_plan = false;
                 let mut items = app.selected();
                 if items.is_empty() {
                     if let Some(i) = app.focused() {
@@ -513,7 +795,7 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
                     app.status = "Wait for pending reviews or cleanup to finish.".into();
                     continue;
                 }
-                if advice::configured().is_empty() {
+                if app.providers.is_empty() {
                     app.popup = Some(Popup::Info(advice::SETUP.into()));
                 } else if items.len() > 8 {
                     app.popup = Some(Popup::Info("Review up to eight items at a time. Reduce your selection to bound provider calls and cost.".into()));
@@ -523,6 +805,7 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
                 app.scroll = 0;
             }
             KeyCode::Char('r') => {
+                app.queued_plan = false;
                 let items = app.selected();
                 if app.planning || app.executing > 0 || items.iter().any(|i| i.reviewing) {
                     app.status = "Wait for the pending review or cleanup to finish.".into();
@@ -534,7 +817,7 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
                 }
             }
             KeyCode::Char('?') => {
-                app.popup = Some(Popup::Info(format!("Inspection issues:\n{}\n\nSpace selects a candidate. Tab changes category. / searches; Esc clears. s changes sorting. PgUp/PgDn scroll details.\n\na requests AI review of selected items, or the highlighted item. You approve metadata sharing first. p reviews eligible items in the current view and builds a draft proposal. Enter adopts it; Space removes exceptions. Models never approve or execute cleanup.\n\nr shows exact selections and consequences. Type the requested phrase and press Enter to delete. Esc cancels. Local checks are repeated first. Worktrees use Git without --force; volumes are confirmed individually.\n\nThe scheduled job produces reports only. Sizes can overlap across stores, areas and children. Unknown sizes are not zero. Some processes deny inspection; protect service paths with --exclude or .dev-sweep-keep.\n\nq exits. For privileged storage sizes, run dev-sweep audit --system outside the TUI.", if app.issues.is_empty() { "None reported so far".into() } else {app.issues.join("\n")})));
+                app.popup = Some(Popup::Info(format!("Inspection issues:\n{}\n\nSpace selects a candidate. Tab changes category. / searches; Esc clears. s changes sorting. PgUp/PgDn scroll details.\n\na requests AI review of selected items, or the highlighted item. You approve metadata sharing first. p or Enter builds a plan or reopens the last plan. n starts a fresh plan. During scan, an empty plan can wait for remaining inventory. The review screen shows progress and errors. Space removes exceptions in the draft; Type the displayed DELETE phrase in the plan and press Enter to approve exact deletion. Models never approve or execute cleanup.\n\nr shows exact selections and consequences. Type the requested phrase and press Enter to delete. Esc cancels. Local checks are repeated first. Worktrees use Git without --force; volumes are confirmed individually.\n\nThe scheduled job produces reports only. Sizes can overlap across stores, areas and children. Unknown sizes are not zero. Some processes deny inspection; protect service paths with --exclude or .dev-sweep-keep.\n\nq exits. For privileged storage sizes, run dev-sweep audit --system outside the TUI.", if app.issues.is_empty() { "None reported so far".into() } else {app.issues.join("\n")})));
                 app.scroll = 0;
             }
             _ => {}
@@ -543,13 +826,36 @@ pub fn run(config: Config, home: PathBuf) -> Result<()> {
     terminal.show_cursor()?;
     Ok(())
 }
+fn begin_cleanup(
+    app: &mut App,
+    items: Vec<Item>,
+    config: &Config,
+    home: &Path,
+    tx: &mpsc::Sender<Event>,
+) {
+    app.scroll = 0;
+    app.executing = items.len();
+    app.status = "Approval received. Rechecking every item before removal.".into();
+    app.report = None;
+    let tx = tx.clone();
+    let config = config.clone();
+    let home = home.to_path_buf();
+    std::thread::spawn(move || {
+        for item in items {
+            let result = inventory::execute(&item, &config, &home).map_err(|e| e.to_string());
+            let _ = tx.send(Event::Finished(item.key, result));
+        }
+    });
+}
 fn start_reviews(
     items: Vec<Item>,
     providers: Vec<advice::Provider>,
     days: u64,
     tx: mpsc::Sender<Event>,
     proposal: bool,
-) {
+) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stopped = cancel.clone();
     std::thread::spawn(move || {
         let results = std::sync::Mutex::new(Vec::new());
         std::thread::scope(|scope| {
@@ -558,20 +864,21 @@ fn start_reviews(
                 let providers = &providers;
                 let tx = &tx;
                 let results = &results;
+                let stopped = &stopped;
                 scope.spawn(move || {
                     for item in items.iter().skip(worker).step_by(4) {
-                        let reviews: Vec<_> = providers
-                            .iter()
-                            .map(|p| advice::review(p.clone(), item.decision_evidence(days)))
-                            .collect();
-                        if proposal {
-                            results.lock().unwrap().push((item.key.clone(), reviews));
-                        } else {
-                            let _ = tx.send(Event::Advice(
-                                item.key.clone(),
-                                reviews.into_iter().map(|r| r.text).collect(),
-                            ));
+                        let mut reviews = Vec::new();
+                        for p in providers {
+                            if stopped.load(Ordering::Relaxed) { break; }
+                            let review = advice::review(p.clone(), item.decision_evidence(days));
+                            if review.terminal_failure { stopped.store(true, Ordering::Relaxed); }
+                            reviews.push(review);
                         }
+                        if reviews.len() != providers.len() || reviews.is_empty() {
+                            reviews.push(advice::Review { text: "UNREVIEWED: Batch stopped or cancelled. No recommendation was inferred. Start a new plan after resolving the provider error.".into(), regenerable: false, failed: true, terminal_failure: false });
+                        }
+                        let _ = tx.send(Event::ReviewProgress { key: item.key.clone(), reviews: reviews.clone() });
+                        if proposal { results.lock().unwrap().push((item.key.clone(), reviews)); }
                     }
                 });
             }
@@ -580,6 +887,7 @@ fn start_reviews(
             let _ = tx.send(Event::Proposal(results.into_inner().unwrap()));
         }
     });
+    cancel
 }
 fn safe(text: &str) -> String {
     text.chars()
@@ -675,6 +983,10 @@ fn draw(frame: &mut Frame, app: &App, days: u64) {
         .sum();
     let state = if app.executing > 0 {
         "CLEANUP RUNNING"
+    } else if app.review_cancel.is_some() {
+        "AI REVIEW"
+    } else if app.queued_plan {
+        "WAITING FOR SCAN"
     } else if app.scanning {
         "SCANNING"
     } else {
@@ -695,8 +1007,19 @@ fn draw(frame: &mut Frame, app: &App, days: u64) {
                 days
             )),
             Line::styled(
-                "Daily scheduling is report-only. You approve every cleanup.",
-                Style::new().fg(MUTED),
+                if app.review_cancel.is_some() {
+                    app.review_progress()
+                } else if app.queued_plan {
+                    "Plan queued. Waiting for inventory, then metadata approval.".into()
+                } else if app.report.is_some() {
+                    "[ Enter / p ] Review last cleanup plan    [ n ] Build a new plan".into()
+                } else {
+                    format!(
+                        "[ Enter / p ] Build cleanup plan    {} eligible candidates in this view",
+                        app.proposal_candidates().len()
+                    )
+                },
+                Style::new().fg(ACCENT).bold(),
             ),
             Line::styled(
                 app.disk
@@ -824,7 +1147,13 @@ fn draw(frame: &mut Frame, app: &App, days: u64) {
     } else {
         format!(
             "{spinner} {}{}",
-            safe(&app.status),
+            safe(&if app.review_cancel.is_some() {
+                app.review_progress()
+            } else if app.status.is_empty() {
+                app.scan_status.clone()
+            } else {
+                app.status.clone()
+            }),
             if app.query.is_empty() {
                 String::new()
             } else {
@@ -833,12 +1162,12 @@ fn draw(frame: &mut Frame, app: &App, days: u64) {
         )
     };
     frame.render_widget(
-        Paragraph::new(status)
+        Paragraph::new(format!("{status}\n{}", safe(&app.scan_status)))
             .wrap(Wrap { trim: false })
             .style(Style::new().fg(WARN)),
         chunks[3],
     );
-    frame.render_widget(Paragraph::new("↑↓ move   Space select   Tab category   / search   a AI review   p cleanup proposal\nr review deletion   s sort   ? help   q quit").style(Style::new().fg(MUTED)),chunks[4]);
+    frame.render_widget(Paragraph::new("Enter / p cleanup plan   n new plan   ↑↓ browse   Tab category   / search\nSpace select   r review selections   a single AI review   ? help   q quit").style(Style::new().fg(MUTED)),chunks[4]);
     if let Some(popup) = &app.popup {
         let modal = Rect {
             x: area.x + area.width / 16,
@@ -847,43 +1176,56 @@ fn draw(frame: &mut Frame, app: &App, days: u64) {
             height: area.height - area.height / 6,
         };
         frame.render_widget(Clear, modal);
+        if let Popup::Proposal { report, deferred } = popup {
+            draw_proposal(frame, app, report, *deferred, modal);
+            return;
+        }
         let (title, text, input) = match popup {
             Popup::Info(s) => (" Help / setup ", s.clone(), None),
-            Popup::Ai(items) | Popup::PlanRequest(items) => {
-                let providers = advice::configured()
-                    .into_iter()
-                    .map(|p| p.label)
+            Popup::Ai(items) | Popup::PlanRequest(items) | Popup::Metadata { items, .. } => {
+                let providers = app
+                    .providers
+                    .iter()
+                    .map(|p| p.label.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let mut text = format!("Send cleanup metadata for {} item(s) to:\n{}\n\nIncludes paths/names, sizes, category, local blockers, planned action and consequences. File contents and API keys are not included in the prompt. Provider calls may incur charges.\n\nUp to four concurrent calls; one per item per provider. Long metadata is refused rather than truncated. No files or selections change. Enter approves metadata sharing only.\n\nMETADATA TO SEND\n",items.len(),providers);
-                for item in items {
-                    text.push_str(
-                        &serde_json::to_string_pretty(&item.decision_evidence(days)).unwrap(),
-                    );
-                    text.push_str("\n\n");
-                }
-                (" Request AI safety advice ", text, None)
-            }
-            Popup::Proposal(items) => {
-                let mut text = format!("{}\n\n{} item(s) proposed for your review. Enter REPLACES your current selections with this draft. Esc keeps existing selections. Nothing is deleted. Then remove exceptions with Space and press r for final approval.\n\nModel agreement is not proof of safety. Native stores and volumes require separate manual review.\n\n", app.status, items.len());
-                for item in items {
-                    text.push_str(&format!(
-                        "{} · {}\n{}\n{}\n{}\n\n",
-                        item.label,
-                        item.bytes
-                            .map(human_size)
-                            .unwrap_or_else(|| "Unknown size".into()),
-                        item.location,
-                        item.consequence,
-                        item.advice.join("\n")
-                    ));
+                let bytes: u64 = items.iter().filter_map(|i| i.bytes).sum();
+                let mut text = format!("Review {} cleanup candidates · {} estimated space\n\nModel: {}\n\nEnter starts {} provider requests, with up to four running at once. Requests may cost money. {}\n\nShared: paths, sizes, activity timestamps, local checks and removal consequences. File contents and keys are not sent.\n\nThis creates a draft only. You approve exact deletion separately. Press m to inspect the exact metadata.\n\nCANDIDATES\n", items.len(), human_size(bytes), providers, items.len()*app.providers.len(), if app.scanning { "The scan is still running; this reviews the current snapshot." } else { "Inventory is complete." });
+                if matches!(popup, Popup::Metadata { .. }) {
+                    text.push_str("\nEXACT METADATA\n");
+                    for item in items {
+                        text.push_str(
+                            &serde_json::to_string_pretty(&item.decision_evidence(days)).unwrap(),
+                        );
+                        text.push_str("\n\n");
+                    }
+                } else {
+                    for item in items {
+                        text.push_str(&format!(
+                            "{} · {}\n{}\n\n",
+                            item.bytes
+                                .map(human_size)
+                                .unwrap_or_else(|| "Unknown size".into()),
+                            item.label,
+                            item.scope
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| item.location.clone())
+                        ));
+                    }
                 }
                 (
-                    " Cleanup proposal · Enter adopts / Esc cancels ",
+                    if matches!(popup, Popup::Ai(_)) {
+                        " Review with AI "
+                    } else {
+                        " Build cleanup plan "
+                    },
                     text,
                     None,
                 )
             }
+            Popup::NoCandidates(text) => (" No eligible candidates yet ", text.clone(), None),
+            Popup::Proposal { .. } => unreachable!(),
             Popup::Delete(items, input) => {
                 let mut text = format!("Permanently remove {} selected item(s). There is no undo. Each action is rechecked immediately before execution.\n\n",items.len());
                 for item in items {
@@ -941,13 +1283,162 @@ fn draw(frame: &mut Frame, app: &App, days: u64) {
                 },
                 safe(input)
             ),
-            None => "Enter continues. Esc cancels. PgUp/PgDn scroll.".into(),
+            None => match popup {
+                Popup::Ai(_) | Popup::PlanRequest(_) | Popup::Metadata { .. } => "[ Enter ] Start AI review    [ m ] Metadata    [ Esc ] Cancel\nPgUp/PgDn scroll. No deletion is approved.".into(),
+                Popup::NoCandidates(_) if app.scanning => "[ Enter ] Wait for remaining inventory    [ Esc ] Back\nNo model requests or deletion start while waiting.".into(),
+                Popup::NoCandidates(_) => "[ Enter ] Show All    [ Esc ] Back\nLocal protections remain in force.".into(),
+                _ => "[ Enter / Esc ] Back    PgUp/PgDn scroll.".into(),
+            },
         };
         frame.render_widget(
             Paragraph::new(footer).style(Style::new().fg(ACCENT)),
             parts[1],
         );
     }
+}
+fn draw_proposal(frame: &mut Frame, app: &App, report: &PlanReport, deferred: bool, area: Rect) {
+    frame.render_widget(
+        panel(" Review cleanup plan ").border_style(Style::new().fg(ACCENT)),
+        area,
+    );
+    let inner = area.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let parts = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(4),
+    ])
+    .split(inner);
+    let chosen = report.chosen();
+    let bytes: u64 = chosen.iter().filter_map(|i| i.bytes).sum();
+    let summary = vec![
+        Line::styled(
+            format!(
+                "{} checked · {} estimated space · {} AI-reviewed",
+                chosen.len(),
+                human_size(bytes),
+                report.reviewed
+            ),
+            Style::new().fg(ACCENT).bold(),
+        ),
+        Line::from(format!(
+            "{} proposed · {} need review · {} failed",
+            report.proposed.len(),
+            report.deferred.len(),
+            report.failed
+        )),
+        Line::styled(
+            "Untick exceptions. Deletion is permanent.",
+            Style::new().fg(WARN),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(summary), parts[0]);
+    frame.render_widget(
+        Paragraph::new(if deferred {
+            "[Tab] Proposed files     > Needs review / errors"
+        } else {
+            "> Proposed files     [Tab] Needs review / errors"
+        })
+        .style(Style::new().fg(ACCENT)),
+        parts[1],
+    );
+    let items = if deferred {
+        &report.deferred
+    } else {
+        &report.proposed
+    };
+    if items.is_empty() {
+        let error = report
+            .deferred
+            .iter()
+            .flat_map(|i| &i.advice)
+            .find(|s| s.contains("UNREVIEWED"));
+        let text = if deferred {
+            "Every reviewed item is in the proposed list. Tab returns to it.".into()
+        } else {
+            format!("No cleanup was recommended. No files or selections changed.\n\n{}\n\nTab shows the retained items and model outcomes. n starts a new review; Esc returns to inventory.", error.cloned().unwrap_or_else(|| "Models retained the candidates or requested investigation. Their recommendations cannot override local protections.".into()))
+        };
+        frame.render_widget(
+            Paragraph::new(safe(&text)).wrap(Wrap { trim: false }),
+            parts[2],
+        );
+    } else {
+        let body = if inner.width >= 100 {
+            Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+                .split(parts[2])
+        } else {
+            Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(parts[2])
+        };
+        let rows: Vec<_> = items
+            .iter()
+            .map(|item| {
+                ListItem::new(vec![
+                    Line::styled(
+                        format!(
+                            "{}  {}  {}",
+                            if deferred {
+                                "[?]"
+                            } else if item.selected {
+                                "[x]"
+                            } else {
+                                "[ ]"
+                            },
+                            item.bytes
+                                .map(human_size)
+                                .unwrap_or_else(|| "Unknown".into()),
+                            safe(&item.label)
+                        ),
+                        Style::new().fg(if deferred { WARN } else { INK }),
+                    ),
+                    Line::styled(
+                        item.scope
+                            .as_ref()
+                            .map(|p| safe(&p.to_string_lossy()))
+                            .unwrap_or_else(|| safe(&item.location)),
+                        Style::new().fg(MUTED),
+                    ),
+                ])
+            })
+            .collect();
+        let mut state =
+            ListState::default().with_selected(Some(app.popup_cursor.min(items.len() - 1)));
+        frame.render_stateful_widget(
+            List::new(rows)
+                .highlight_symbol("› ")
+                .highlight_style(Style::new().bg(Color::Rgb(35, 58, 73))),
+            body[0],
+            &mut state,
+        );
+        if let Some(item) = items.get(app.popup_cursor) {
+            let detail = format!(
+                "{}\n\n{}\n\n{}",
+                item.location,
+                item.consequence,
+                item.advice.join("\n\n")
+            );
+            frame.render_widget(
+                Paragraph::new(safe(&detail))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.scroll, 0))
+                    .block(panel(" Consequences / AI review · PgUp/PgDn ")),
+                body[1],
+            );
+        }
+    }
+    let footer = if chosen.is_empty() {
+        "No files checked. [Tab] Review outcomes  [n] New plan  [Esc] Back".into()
+    } else {
+        format!("Approve deletion: type {}, then Enter\n> {}▏\n{}\n↑↓ inspect   Space untick   Tab outcomes   Esc cancel", phrase(&chosen), safe(&app.plan_confirmation), safe(&app.plan_error))
+    };
+    frame.render_widget(
+        Paragraph::new(footer)
+            .wrap(Wrap { trim: false })
+            .style(Style::new().fg(ACCENT)),
+        parts[3],
+    );
 }
 #[cfg(test)]
 mod tests {
@@ -971,6 +1462,18 @@ mod tests {
             parent_worktree: None,
             included: Vec::new(),
         }
+    }
+    #[test]
+    #[ignore = "invoked by tests/proposal_pty.py in an interactive PTY"]
+    fn proposal_terminal_fixture() {
+        let root = PathBuf::from(env::var("DEV_SWEEP_FIXTURE_ROOT").unwrap());
+        let mut config = Config::defaults(&root);
+        config.roots = vec![root.clone()];
+        config.docker = false;
+        config.global_caches = false;
+        config.normalize(false).unwrap();
+        let provider = advice::fixture_provider(env::var("DEV_SWEEP_FIXTURE_URL").unwrap());
+        run_with_providers(config, root, vec![provider]).unwrap();
     }
     #[test]
     fn approval_requires_exact_selection_and_local_permission() {
@@ -1044,6 +1547,8 @@ mod tests {
         let review = |regenerable| advice::Review {
             text: "fixture".into(),
             regenerable,
+            failed: false,
+            terminal_failure: false,
         };
         app.accept(Event::Proposal(vec![
             (app.items[0].key.clone(), vec![review(true)]),
@@ -1054,9 +1559,10 @@ mod tests {
             app.selected().is_empty(),
             "model output cannot adopt selections"
         );
-        let Some(Popup::Proposal(proposed)) = app.popup.take() else {
+        let Some(Popup::Proposal { report, .. }) = app.popup.take() else {
             panic!("missing proposal")
         };
+        let proposed = report.chosen();
         assert_eq!(proposed.len(), 1);
         app.adopt_proposal(&proposed);
         assert_eq!(app.selected().len(), 1);
@@ -1066,6 +1572,149 @@ mod tests {
         app.items[0].blocked = Some("changed".into());
         app.adopt_proposal(&proposed);
         assert!(app.selected().is_empty());
+    }
+    #[test]
+    fn blocked_worktree_children_and_scan_feedback_remain_actionable() {
+        let mut cache = item();
+        cache.parent_worktree = Some("/tmp/project".into());
+        let mut tree = item();
+        tree.key = "tree".into();
+        tree.action = Action::Worktree("/tmp/project".into());
+        tree.scope = Some("/tmp/project".into());
+        tree.parent_worktree = None;
+        tree.blocked = Some("recent filesystem activity".into());
+        let mut app = App::new();
+        app.providers = vec![advice::fixture_provider("http://127.0.0.1:1".into())];
+        app.items.push(tree);
+        app.begin_plan(true);
+        assert!(matches!(app.popup, Some(Popup::NoCandidates(_))));
+        let status = app.status.clone();
+        app.accept(Event::Status("Measuring another folder".into()));
+        assert_eq!(app.status, status);
+        assert!(matches!(app.popup, Some(Popup::NoCandidates(_))));
+        app.popup = None;
+        app.queued_plan = true;
+        app.accept(Event::Item(Box::new(cache)));
+        assert_eq!(app.proposal_candidates().len(), 1);
+        assert_eq!(app.visible().len(), 2);
+        app.accept(Event::Done);
+        assert!(matches!(app.popup, Some(Popup::PlanRequest(_))));
+        assert!(app.selected().is_empty());
+        app.queued_plan = true;
+        app.popup = Some(Popup::Delete(vec![item()], "DELETE ".into()));
+        app.accept(Event::Done);
+        assert!(matches!(app.popup,Some(Popup::Delete(_,ref input)) if input == "DELETE "));
+    }
+    #[test]
+    fn individual_reviews_finish_and_plan_confirmation_errors_are_visible() {
+        let mut app = App::new();
+        app.items = vec![item()];
+        app.review_total = 1;
+        app.review_cancel = Some(Arc::new(AtomicBool::new(false)));
+        app.accept(Event::ReviewProgress {
+            key: "cache".into(),
+            reviews: vec![advice::Review {
+                text: "mock".into(),
+                regenerable: true,
+                failed: false,
+                terminal_failure: false,
+            }],
+        });
+        assert!(app.review_cancel.is_none());
+        assert!(app.status.contains("finished"));
+        let mut draft = item();
+        draft.selected = true;
+        let report = PlanReport {
+            proposed: vec![draft],
+            reviewed: 1,
+            ..PlanReport::default()
+        };
+        app.popup = Some(Popup::Proposal {
+            report,
+            deferred: false,
+        });
+        app.plan_error = "Nothing deleted. Enter the exact phrase DELETE 1.".into();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app, 30)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Nothing deleted."));
+        assert!(text.contains("DELETE 1"));
+    }
+    #[test]
+    fn terminal_provider_failure_stops_bulk_requests_but_reports_every_candidate() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
+        let server = std::thread::spawn(move || {
+            let mut count = 0;
+            while !finished.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        let mut data = [0; 4096];
+                        let _ = stream.read(&mut data);
+                        write!(stream,"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+                        count += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            count
+        });
+        let items = (0..20)
+            .map(|n| {
+                let mut i = item();
+                i.key = format!("{n}");
+                i
+            })
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let _cancel = start_reviews(
+            items,
+            vec![advice::fixture_provider(format!("http://{address}"))],
+            30,
+            tx,
+            true,
+        );
+        let mut progress = 0;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Event::ReviewProgress { reviews, .. } => {
+                    progress += 1;
+                    assert!(reviews.iter().any(|r| r.failed));
+                }
+                Event::Proposal(results) => {
+                    assert_eq!(results.len(), 20);
+                    assert!(results
+                        .iter()
+                        .all(|(_, r)| r.iter().all(|r| !r.regenerable)));
+                    break;
+                }
+                _ => panic!("Unexpected review event"),
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        let count = server.join().unwrap();
+        assert!(
+            (1..=4).contains(&count),
+            "Failed provider received {count} requests"
+        );
+        assert_eq!(progress, 20);
     }
     #[test]
     fn terminal_layout_shows_risk_and_handles_small_screens() {

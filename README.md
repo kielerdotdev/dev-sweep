@@ -25,13 +25,17 @@ Use `bash install.sh --no-schedule` to install without the daily job. `bash inst
 dev-sweep tui
 ```
 
+Press **p** or **Enter**, then approve the AI review. The AI returns a checklist with every recommended cleanup checked. Untick exceptions with Space, then type the displayed `DELETE N` phrase and press Enter in that same checklist. There is no separate adoption step.
+
 Rows appear as the scan finishes each folder. You can review finished rows while it scans the rest. Large directories take longer to measure; quitting stops the scan workers.
 
 | Key | Action |
 | --- | --- |
 | Up/Down or j/k | Move |
-| Tab / Shift+Tab | Change category |
-| Space | Select or deselect |
+| Tab / Shift+Tab | Change category; Tab in a plan shows review outcomes |
+| Enter / p | Build a cleanup plan, or reopen the last plan |
+| n | Build a fresh plan |
+| Space | Untick a plan exception, or toggle a manual selection |
 | / | Search |
 | s | Change sorting |
 | PgUp / PgDn | Scroll details or a dialog |
@@ -40,9 +44,9 @@ Rows appear as the scan finishes each folder. You can review finished rows while
 | Esc | Cancel |
 | ? / q | Help / quit |
 
-After selecting files, press `r`, read the warnings, and type `DELETE N` for the number of selected items. Docker volumes need their own `DELETE VOLUME exact_name` confirmation, one at a time.
+For manual cleanup, select files with Space and press `r`, read the warnings, and type `DELETE N` for the number of selected items. Docker volumes need their own `DELETE VOLUME exact_name` confirmation, one at a time.
 
-The All category groups dependency folders and build output under their worktree. Removing the worktree includes those folders and keeps the Git branch. Use Caches if you want to remove dependencies while keeping the checkout. You cannot select a folder and its parent together.
+The All category groups dependency folders and build output under removable worktrees. Eligible caches inside retained worktrees appear separately so you can reclaim generated files without removing their checkout. Removing the worktree includes those folders and keeps the Git branch. Use Caches if you want to remove dependencies while keeping the checkout. You cannot select a folder and its parent together.
 
 Sizes are disk occupancy estimates. Nested rows overlap, hardlinks share storage, and Docker layers may still be used elsewhere. Adding all the rows together will overcount.
 
@@ -83,11 +87,13 @@ OpenRouter defaults to `cloudflare/clef` through its Decisions API. Your existin
 export OPENROUTER_MODEL=typesafe/jev-1.13
 ```
 
-Press **p** to build a cleanup proposal for eligible items in the current category and search. No manual selection is needed first. The dialog shows exactly which metadata will be sent; Enter approves those requests. There are at most four concurrent requests, one per item per configured provider, with a 512-item limit per proposal. Narrow the view for smaller batches. Requests may cost money.
+Press **p** or **Enter** to build a cleanup plan for eligible items in the current category and search. No manual selection is needed first. The dialog summarizes the model, request count and shared metadata. Press `m` for exact evidence, or Enter to start reviews. There are at most four concurrent requests, one per item per configured provider, with a 512-item limit per plan. Requests may cost money.
 
-When reviews finish, the draft lists proposed items and their consequences. Enter adopts the draft, replacing your current selections; Esc keeps them. Remove exceptions with Space, then press **r** and type the exact deletion confirmation. Nothing is removed by generating or adopting a proposal. Newly discovered items are not added to an existing draft.
+Review progress stays visible while scanning continues. If no candidates have arrived yet, the empty-state dialog explains why; Enter waits for the remaining inventory and opens metadata approval when ready. It does not start requests automatically. Esc in the inventory stops new requests; already-running requests may take up to 45 seconds to finish. Authentication, credit, model, rate-limit and connection failures stop the remaining batch.
 
-Blocked candidates, native store cleanup, and Docker volumes are excluded from bulk proposals. Worktrees take precedence over their nested build artifacts. Failed reviews, tied choices, and provider disagreements stay out of the proposal. Their advice remains in the details pane. Press **a** to review a highlighted item or up to eight manual selections.
+The AI returns a checklist with recommended items already checked. Space unticks exceptions. Type the displayed `DELETE N` phrase and press Enter to approve and remove those exact items, without leaving the checklist. Tab shows items retained by the models and failed reviews. Esc returns without changing manual selections or deleting anything. `p` reopens the saved plan without new requests; `n` starts a fresh review. Newly discovered items are not added to an existing draft.
+
+Blocked candidates, native store cleanup, and Docker volumes are excluded from bulk plans. Worktrees take precedence over their nested build artifacts; independently eligible caches in blocked worktrees remain available. Failed reviews, tied choices, and provider disagreements stay unchecked. Press **a** to review a highlighted item or up to eight manual selections.
 
 | Provider | Environment variables |
 | --- | --- |
@@ -192,6 +198,8 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 python3 tests/tui_pty.py
+# The script finds the test-only PTY fixture built by cargo test.
+python3 tests/proposal_pty.py
 python3 tests/scan_cancel_pty.py
 cargo build --release --locked
 python3 tests/scan_benchmark.py target/release/dev-sweep

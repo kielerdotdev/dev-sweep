@@ -43,7 +43,7 @@ Rust checks the facts. Models classify the remaining uncertainty. Git cleanlines
 
 A three-way choice fits the workflow: propose regenerable data, investigate, or retain. A single “safe to delete” boolean hides unknown recovery requirements and user intent. The model has not inspected source files, backups, or every process.
 
-TypeSafe documents Choice confidence as a normalized maximum probability, `(p_max - 1/n) / (1 - 1/n)`. A confidence of 95% is not evidence that deletion is safe 95% of the time. A universal numeric approval threshold would be invented. This implementation uses no such threshold: model agreement produces a draft only, with explicit user adoption and separate deletion approval. Tied choices and malformed answers are not proposed. Additional providers can reject a draft item; agreement is not proof that their failures are independent.
+TypeSafe documents Choice confidence as a normalized maximum probability, `(p_max - 1/n) / (1 - 1/n)`. A confidence of 95% is not evidence that deletion is safe 95% of the time. A universal numeric approval threshold would be invented. This implementation uses no such threshold: model agreement produces a draft only, with explicit approval of the exact deletion. Tied choices and malformed answers are not proposed. Additional providers can reject a draft item; agreement is not proof that their failures are independent.
 
 Source: [TypeSafe confidence definitions](https://docs.typesafe.ai/confidence).
 
@@ -55,10 +55,9 @@ Source: [Decision model prompt sensitivity preprint](https://arxiv.org/abs/2610.
 
 1. Scan locally; choose a category or search if needed.
 2. Press `p`; inspect metadata and approve sending it.
-3. Review the draft. Failed, conflicting, blocked, and persistent-store cases remain outside it.
-4. Enter adopts the proposal; Space removes exceptions. Esc cancels without changing existing selections.
-5. Press `r`, review exact actions, and type the required confirmation.
-6. Recheck local guards immediately before every action.
+3. Review the checklist. Recommendations are checked; Space unticks exceptions. Tab shows deferred items and failures.
+4. Type the displayed `DELETE N` phrase and press Enter in the checklist to approve exact removal. Esc cancels without changing manual selections.
+5. Recheck local guards immediately before every action.
 
 The daily task remains report-only and makes no model requests. Proposal generation never starts automatically. Worktree proposals include their generated children once; child paths are not separately selected. Native package stores and Docker volumes still require manual review.
 

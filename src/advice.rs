@@ -9,6 +9,16 @@ pub struct Provider {
     model: String,
 }
 
+#[cfg(test)]
+pub fn fixture_provider(url: String) -> Provider {
+    Provider {
+        label: "Fixture decisions".into(),
+        url,
+        key: "fixture-secret".into(),
+        model: "cloudflare/clef".into(),
+    }
+}
+
 pub fn configured() -> Vec<Provider> {
     let mut providers = Vec::new();
     if let (Ok(key), Ok(account)) = (
@@ -109,16 +119,19 @@ fn parse(provider: &Provider, response: &Value) -> std::result::Result<Review, S
         .as_str()
         .filter(|s| s.len() <= 200)
         .unwrap_or(&provider.model);
-    Ok(Review { regenerable: choice == "regenerable" && distribution.iter().all(|(name, p)| name == choice || p.as_f64().is_some_and(|p| p < chosen)), text: format!("{} (resolved model: {}): {}\nModel confidence {:.0}%. {}.\nConfidence describes the model answer, not the probability deletion is safe.",provider.label,resolved,choice.to_uppercase(),confidence*100.0,detail.join(" / ")) })
+    Ok(Review { regenerable: choice == "regenerable" && distribution.iter().all(|(name, p)| name == choice || p.as_f64().is_some_and(|p| p < chosen)), failed: false, terminal_failure: false, text: format!("{} (resolved model: {}): {}\nModel confidence {:.0}%. {}.\nConfidence describes the model answer, not the probability deletion is safe.",provider.label,resolved,choice.to_uppercase(),confidence*100.0,detail.join(" / ")) })
 }
 
 #[derive(Clone)]
 pub struct Review {
     pub text: String,
     pub regenerable: bool,
+    pub failed: bool,
+    pub terminal_failure: bool,
 }
 
 pub fn review(provider: Provider, state: Value) -> Review {
+    let mut terminal_failure = false;
     let result = (|| -> std::result::Result<Review, String> {
         // Conservative byte bound: never silently truncate long evidence on Clef.
         if state.to_string().len() > 1800 {
@@ -134,16 +147,24 @@ pub fn review(provider: Provider, state: Value) -> Review {
             .send_json(request(&provider, &state))
             .map_err(|e| match e {
                 ureq::Error::Status(code, _) => {
-                    format!("HTTP {code}; check credentials, model availability or limits")
+                    terminal_failure = matches!(code, 400 | 401 | 402 | 403 | 404 | 408 | 429) || code >= 500;
+                    if code >= 500 || code == 408 {
+                        format!("HTTP {code}; provider unavailable. Batch stopped; retry later")
+                    } else {
+                        format!("HTTP {code}; check credentials, model availability or limits")
+                    }
                 }
-                _ => "Network request failed or timed out".into(),
+                _ => { terminal_failure = true; "Network request failed or timed out; batch stopped. Check connectivity and retry".into() },
             })?;
         let mut body = String::new();
         response
             .into_reader()
             .take(65537)
             .read_to_string(&mut body)
-            .map_err(|_| "Cannot read provider response")?;
+            .map_err(|_| {
+                terminal_failure = true;
+                "Cannot read provider response; batch stopped"
+            })?;
         if body.len() > 65536 {
             return Err("Provider response exceeded 64 KiB".into());
         }
@@ -153,6 +174,8 @@ pub fn review(provider: Provider, state: Value) -> Review {
     })();
     result.unwrap_or_else(|e| Review {
         regenerable: false,
+        failed: true,
+        terminal_failure,
         text: format!(
             "{}: UNREVIEWED\n{e}. No approval was inferred.",
             provider.label
@@ -163,6 +186,32 @@ pub fn review(provider: Provider, state: Value) -> Review {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 2048];
+        loop {
+            let n = stream.read(&mut buffer).unwrap();
+            assert_ne!(n, 0, "Request ended before its declared body");
+            bytes.extend_from_slice(&buffer[..n]);
+            let s = String::from_utf8_lossy(&bytes);
+            if let Some((head, body)) = s.split_once("\r\n\r\n") {
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|s| s.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                if body.len() >= length {
+                    return String::from_utf8(bytes).unwrap();
+                }
+            }
+        }
+    }
     fn provider() -> Provider {
         Provider {
             label: "test".into(),
@@ -175,7 +224,10 @@ mod tests {
     fn invalid_decisions_fail_closed() {
         let p = provider();
         let mut v = json!({"answers":{"review":{"type":"choice","choice":"regenerable","confidence":0.8,"probabilities":{"regenerable":0.8,"investigate":0.15,"retain":0.05}}}});
-        assert!(parse(&p, &v).unwrap().text.contains("REGENERABLE"));
+        let successful = parse(&p, &v).unwrap();
+        assert!(successful.text.contains("REGENERABLE"));
+        assert!(!successful.failed);
+        assert!(!successful.terminal_failure);
         v["answers"]["review"]["probabilities"]["retain"] = json!(2);
         assert!(parse(&p, &v).is_err());
         v["answers"]["review"]["choice"] = json!("delete_now");
@@ -192,6 +244,8 @@ mod tests {
     fn oversized_evidence_and_tied_answers_are_not_proposed() {
         let result = review(provider(), json!({"path":"x".repeat(2000)}));
         assert!(!result.regenerable);
+        assert!(result.failed);
+        assert!(!result.terminal_failure);
         assert!(result.text.contains("budget"));
         let missing = json!({"answers":{"review":{"type":"choice","choice":"regenerable","confidence":0.8,"probabilities":{"a":0.8,"b":0.1,"c":0.1}}}});
         assert!(parse(&provider(), &missing).is_err());
@@ -203,39 +257,59 @@ mod tests {
     }
     #[test]
     fn http_advice_is_metadata_only_and_bounded() {
+        use crate::inventory::{Action, Item};
         use std::io::Write;
         use std::net::TcpListener;
+        let scope = std::path::PathBuf::from("/home/user/projects/media/boomerplay/.claude/worktrees/metadata-test-agent-f0259190b22b2b1f");
+        let item = Item {
+            key: "fixture".into(),
+            label: "Worktree: metadata-test-agent-f0259190b22b2b1f · 50 caches included".into(),
+            location: format!("{scope:?}"),
+            group: "Worktrees",
+            bytes: Some(4_500_000_000),
+            size_note: "Allocated size; nested rows overlap".into(),
+            blocked: None,
+            consequence: "Removes this entire checkout, including its recognized ignored dependency folders and build output, with git worktree remove without --force. The branch is preserved. No separate cache removal is required.".into(),
+            action: Action::Worktree(scope.clone()),
+            scope: Some(scope.clone()),
+            snapshot: Some((1, 2, crate::Stats {
+                bytes: 4_500_000_000,
+                newest: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000)),
+            })),
+            selected: false,
+            advice: Vec::new(),
+            reviewing: false,
+            parent_worktree: None,
+            included: (0..50).map(|i| format!("node_modules: {scope:?}/packages/{i}/node_modules")).collect(),
+        };
+        let evidence = item.decision_evidence(30);
+        assert!(item.evidence(30).to_string().len() > 1800);
+        assert!(evidence.to_string().len() <= 1800);
+        assert_eq!(evidence["included_generated_count"], 50);
+        assert_eq!(evidence["local_checks_passed"], true);
+        assert_eq!(evidence["worktree_commits_remain_reachable"], true);
+        assert_eq!(evidence["resolved_cleanup_scope"], scope.to_str().unwrap());
+        assert_eq!(
+            evidence
+                .to_string()
+                .matches(scope.to_str().unwrap())
+                .count(),
+            1
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0; 2048];
-            loop {
-                let n = stream.read(&mut buffer).unwrap();
-                bytes.extend_from_slice(&buffer[..n]);
-                let s = String::from_utf8_lossy(&bytes);
-                if let Some((head, body)) = s.split_once("\r\n\r\n") {
-                    let length = head
-                        .lines()
-                        .find_map(|l| {
-                            l.to_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|s| s.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap();
-                    if body.len() >= length {
-                        break;
-                    }
-                }
-            }
-            let request = String::from_utf8(bytes).unwrap();
-            assert!(request.contains("Bearer secret"));
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("POST /api/alpha/decisions HTTP/1.1\r\n"));
+            assert!(request.contains("Bearer fixture-secret"));
             assert!(request.contains("metadata-test"));
             assert!(!request.split_once("\r\n\r\n").unwrap().1.contains("secret"));
+            let request: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(request["model"], "cloudflare/clef");
+            assert!(request.get("messages").is_none());
+            assert_eq!(request["questions"]["review"]["type"], "choice");
             let body=json!({"answers":{"review":{"type":"choice","choice":"investigate","confidence":0.8,"probabilities":{"regenerable":0.1,"investigate":0.8,"retain":0.1}}}}).to_string();
             write!(
                 stream,
@@ -245,11 +319,64 @@ mod tests {
             )
             .unwrap();
         });
-        let mut p = provider();
-        p.url = format!("http://{address}");
-        assert!(review(p, json!({"path":"metadata-test"}))
-            .text
-            .contains("INVESTIGATE"));
+        let p = fixture_provider(format!("http://{address}/api/alpha/decisions"));
+        let result = review(p, evidence);
+        assert!(result.text.contains("INVESTIGATE"));
+        assert!(!result.failed);
+        assert!(!result.terminal_failure);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_errors_are_structured_and_do_not_expose_response_bodies() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        for status in [400, 401, 402, 403, 404, 408, 429, 500] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                let body = "secret-response-body";
+                write!(stream, "HTTP/1.1 {status} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let result = review(
+                fixture_provider(format!("http://{address}")),
+                json!({"scope":"fixture"}),
+            );
+            assert!(result.failed);
+            assert!(!result.regenerable);
+            assert!(result.terminal_failure);
+            assert!(result.text.contains(&format!("HTTP {status}")));
+            assert!(!result.text.contains("secret-response-body"));
+            assert!(!result.text.contains("fixture-secret"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_json_is_a_failed_review_rather_than_a_recommendation() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json"
+            )
+            .unwrap();
+        });
+        let result = review(
+            fixture_provider(format!("http://{address}")),
+            json!({"scope":"fixture"}),
+        );
+        assert!(result.failed);
+        assert!(!result.regenerable);
+        assert!(!result.terminal_failure);
+        assert!(result.text.contains("invalid JSON"));
         server.join().unwrap();
     }
 }
