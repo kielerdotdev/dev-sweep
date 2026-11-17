@@ -51,6 +51,7 @@ use std::os::unix::fs::OpenOptionsExt;
 #[derive(Clone)]
 pub struct Settings {
     enabled: bool,
+    requires_push: bool,
     roots: Vec<PathBuf>,
     custom_roots: bool,
     state: PathBuf,
@@ -65,6 +66,7 @@ impl Settings {
     pub fn new(home: &Path) -> Self {
         Self {
             enabled: false,
+            requires_push: true,
             custom_roots: false,
             roots: vec![home.join(".t3/worktrees"), home.join(".codex/worktrees")],
             state: home.join(".t3/userdata/statev2.sqlite"),
@@ -79,6 +81,7 @@ impl Settings {
     pub fn set(&mut self, key: &str, value: &str, home: &Path) -> Result<()> {
         match key {
             "reap" => self.enabled = value.parse()?,
+            "reap_requires_push" => self.requires_push = value.parse()?,
             "agent_root" => {
                 let path = expand(value, home)?;
                 if !self.custom_roots {
@@ -107,7 +110,7 @@ impl Settings {
         Ok(())
     }
     pub fn write(&self, file: &mut fs::File) -> Result<()> {
-        writeln!(file, "reap={}\nt3_state={}\nreap_after_hours={}\norphan_idle_days={}\nartifact_idle_days={}\nvolume_after_hours={}\nsnapshot_max_file_mb={}\nsnapshot_max_total_mb={}", self.enabled, self.state.display(), self.after, self.orphan, self.artifact, self.volume, self.file_mb, self.total_mb)?;
+        writeln!(file, "reap={}\nreap_requires_push={}\nt3_state={}\nreap_after_hours={}\norphan_idle_days={}\nartifact_idle_days={}\nvolume_after_hours={}\nsnapshot_max_file_mb={}\nsnapshot_max_total_mb={}", self.enabled, self.requires_push, self.state.display(), self.after, self.orphan, self.artifact, self.volume, self.file_mb, self.total_mb)?;
         for root in &self.roots {
             writeln!(file, "agent_root={}", root.display())?;
         }
@@ -233,6 +236,55 @@ fn old_git(path: &Path, cutoff: SystemTime) -> Result<()> {
         }
     }
     Ok(())
+}
+/// The worktree holds no work that exists only here: nothing uncommitted or untracked, and
+/// HEAD is on a remote-tracking ref or every change it carries is already in a remote's
+/// main branch (squash merges and cherry-picks count, by patch or by resulting content).
+fn pushed(path: &Path) -> Result<()> {
+    if !text(path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty() {
+        return Err("uncommitted or untracked changes not pushed".into());
+    }
+    let head = optional_ref(path, &["rev-parse", "--verify", "--quiet", "HEAD"])?
+        .ok_or("no commits to push")?;
+    if !text(
+        path,
+        &[
+            "for-each-ref",
+            "--contains",
+            &head,
+            "--format=%(refname)",
+            "refs/remotes/",
+        ],
+    )?
+    .is_empty()
+    {
+        return Ok(());
+    }
+    let refs = text(
+        path,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
+    )?;
+    for upstream in refs
+        .lines()
+        .filter(|r| r.ends_with("/main") || r.ends_with("/master"))
+    {
+        let cherry = text(path, &["cherry", upstream, &head])?;
+        if !cherry.lines().any(|l| l.starts_with('+')) {
+            return Ok(());
+        }
+        let base = text(path, &["merge-base", upstream, &head])?;
+        let changed = text(path, &["diff", "--name-only", &base, &head])?;
+        if changed.is_empty() {
+            continue;
+        }
+        let mut args = vec!["diff", "--quiet", upstream, head.as_str(), "--"];
+        args.extend(changed.lines());
+        // `git diff --quiet` exits 0 for no difference and 1 for a difference.
+        if optional_ref(path, &args)?.is_some() {
+            return Ok(());
+        }
+    }
+    Err("HEAD not pushed".into())
 }
 struct Files {
     ignored: Vec<PathBuf>,
@@ -367,6 +419,9 @@ fn eligible(
         old_git(path, idle.cutoff())?;
         Vec::new()
     };
+    if config.reap.requires_push {
+        pushed(path)?;
+    }
     let info = stats_inner(path, config, true, false)?;
     Ok((info, ids, snapshot_files(path, config)?))
 }

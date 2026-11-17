@@ -219,6 +219,7 @@ contains `reap=true`. Scan and clean never remove worktrees; explicit
 
 ```ini
 reap=false
+reap_requires_push=true
 agent_root=~/.t3/worktrees
 agent_root=~/.codex/worktrees
 t3_state=~/.t3/userdata/statev2.sqlite
@@ -238,9 +239,15 @@ and keep markers still apply. Durations and MiB limits are positive integers.
 T3 is opened strictly read-only, including when its live database uses WAL.
 Every referencing thread must be archived, deleted, or explicitly settled with a
 settlement timestamp. An active override wins over a stale settlement timestamp.
-The newest completion or update must be at least `reap_after_hours` old. Missing,
-unreadable or unrecognised T3 data is unknown; only the conservative orphan idle
-rule can then qualify a worktree. Orphans need both filesystem and Git inactivity.
+The newest completion or update must be at least `reap_after_hours` old. Without a
+T3 database only the conservative orphan idle rule can qualify a worktree; a database
+that exists but cannot be read retains every worktree.
+
+With `reap_requires_push=true` (the default), a worktree also has to hold no work
+that exists only on this machine: no uncommitted or untracked changes, and HEAD on a
+remote-tracking branch or already contained in a remote `main`/`master` (squash merges
+and cherry-picks count). Set it to `false` to reap unpushed work too; the local
+snapshot below is then the only copy. Orphans need both filesystem and Git inactivity.
 Other agents use that same orphan rule. Main, bare, locked, busy, protected,
 submodule-containing and nested-repository worktrees stay. Large untracked or
 ignored non-artifact files block snapshots at the per-file or total limit.

@@ -110,6 +110,7 @@ impl Config {
                 "docker" => config.docker = value.trim().parse()?,
                 "global_caches" => config.global_caches = value.trim().parse()?,
                 "reap"
+                | "reap_requires_push"
                 | "agent_root"
                 | "t3_state"
                 | "reap_after_hours"

@@ -741,7 +741,7 @@ fn reap_fixture() -> (Fixture, PathBuf, PathBuf) {
         &repo,
         &["worktree", "add", "-b", "lane", path.to_str().unwrap()],
     );
-    f.file("config", &format!("reap=true\ndocker=false\nglobal_caches=false\nagent_root={}\nt3_state={}\nsnapshot_max_file_mb=1\n", f.0.join("agents").display(), f.0.join("state.sqlite").display()));
+    f.file("config", &format!("reap=true\nreap_requires_push=false\ndocker=false\nglobal_caches=false\nagent_root={}\nt3_state={}\nsnapshot_max_file_mb=1\n", f.0.join("agents").display(), f.0.join("state.sqlite").display()));
     (f, repo, path)
 }
 fn thread_db(f: &Fixture, path: &Path, active: bool) {
@@ -749,6 +749,59 @@ fn thread_db(f: &Fixture, path: &Path, active: bool) {
     db.execute_batch("CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, archived_at TEXT, deleted_at TEXT, updated_at TEXT, payload_json TEXT)").unwrap();
     let payload = serde_json::json!({"worktreePath": path, "settledOverride": if active {"active"} else {"settled"}, "settledAt": "2000-01-01T00:00:00Z"});
     db.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('thread',NULL,NULL,'2000-01-01T00:00:00Z',?1)", [payload.to_string()]).unwrap();
+}
+#[test]
+fn reap_requires_push_keeps_local_only_work_by_default() {
+    let (f, repo, path) = reap_fixture();
+    thread_db(&f, &path, false);
+    let config = fs::read_to_string(f.0.join("config"))
+        .unwrap()
+        .replace("reap_requires_push=false\n", "");
+    f.file("config", &config);
+    let remote = f.0.join("remote.git");
+    git(&f.0, &["init", "--bare", remote.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    // A local-only commit on the lane branch is not pushed work.
+    fs::write(path.join("source"), "local only").unwrap();
+    git(&path, &["commit", "-qam", "local"]);
+    let out = reap_run(&f, &["reap", "--apply"]);
+    success(&out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("HEAD not pushed"));
+    assert!(path.exists());
+    // An uncommitted change is not pushed either.
+    git(&path, &["push", "-q", "origin", "lane"]);
+    fs::write(path.join("source"), "dirty").unwrap();
+    let out = reap_run(&f, &["reap", "--apply"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("uncommitted"));
+    assert!(path.exists());
+    // Committed and pushed: reaped.
+    git(&path, &["checkout", "-q", "--", "source"]);
+    success(&reap_run(&f, &["reap", "--apply"]));
+    assert!(!path.exists());
+    // Work squash-merged into the remote main also counts as pushed.
+    let (f, repo, path) = reap_fixture();
+    thread_db(&f, &path, false);
+    let config = fs::read_to_string(f.0.join("config"))
+        .unwrap()
+        .replace("reap_requires_push=false\n", "");
+    f.file("config", &config);
+    let remote = f.0.join("remote.git");
+    git(&f.0, &["init", "--bare", remote.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    fs::write(path.join("source"), "squashed").unwrap();
+    git(&path, &["commit", "-qam", "lane work"]);
+    fs::write(repo.join("source"), "squashed").unwrap();
+    git(&repo, &["commit", "-qam", "squash of lane"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    success(&reap_run(&f, &["reap", "--apply"]));
+    assert!(!path.exists());
 }
 #[test]
 fn reap_restore_preserves_dirty_staged_untracked_ignored_and_branch() {
