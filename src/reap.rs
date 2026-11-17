@@ -705,6 +705,43 @@ pub fn restore(home: &Path, path: &Path, apply: bool) -> Result<()> {
     Ok(())
 }
 
+/// Re-checks one worktree against live state, snapshots it, verifies the snapshot and removes it.
+/// Any failure leaves the worktree in place; the caller reports it and moves on.
+fn reap_one(
+    tree: &Worktree,
+    scope: &Config,
+    config: &Config,
+    home: &Path,
+    docker: Option<&mut Docker>,
+) -> Result<()> {
+    let current = if config.reap.state.exists() {
+        threads(&config.reap.state)?
+    } else {
+        BTreeMap::new()
+    };
+    let (info, ids, files) = eligible(tree, &worktrees(&tree.path)?, scope, &busy()?, &current)?;
+    let record = snapshot(&tree.path, home, ids, &info, files)?;
+    verify_snapshot(&record, scope)?;
+    if busy()?.iter().any(|p| p.starts_with(&tree.path)) {
+        return Err("worktree became busy after snapshot; retained".into());
+    }
+    if let Some(d) = docker {
+        d.remove_worktree(&tree.path)?;
+    }
+    git(
+        &record.common_dir,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("remove"),
+            OsStr::new("--force"),
+            OsStr::new("--"),
+            tree.path.as_os_str(),
+        ],
+    )?;
+    text(&record.common_dir, &["worktree", "prune"])?;
+    Ok(())
+}
+
 pub fn run(config: &Config, home: &Path, apply: bool) -> Result<()> {
     if apply && !config.reap.enabled {
         return Err("reap --apply requires reap=true in config".into());
@@ -717,12 +754,14 @@ pub fn run(config: &Config, home: &Path, apply: bool) -> Result<()> {
         .filter(|p| p.exists())
         .map(fs::canonicalize)
         .collect::<io::Result<_>>()?;
-    let states = match threads(&config.reap.state) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("T3 unknown: {e}; orphan idle checks apply");
-            BTreeMap::new()
-        }
+    // A missing database means T3 is not used here, so the orphan rule applies. A database
+    // that exists but cannot be read is unknown state: reaping worktrees then is unsafe.
+    let states = if config.reap.state.exists() {
+        threads(&config.reap.state)
+            .map_err(|e| eprintln!("T3 state unreadable, worktrees retained: {e}"))
+            .ok()
+    } else {
+        Some(BTreeMap::new())
     };
     let mut docker = if config.docker {
         Docker::load().map(Some).unwrap_or_else(|e| {
@@ -774,14 +813,18 @@ pub fn run(config: &Config, home: &Path, apply: bool) -> Result<()> {
             {
                 continue;
             }
-            let check = eligible(tree, &trees, &scope, &initial_busy, &states).and_then(|v| {
-                if let Some(d) = &docker {
-                    d.check_worktree(&tree.path)?;
-                } else if config.docker {
-                    return Err("Docker state unknown".into());
-                }
-                Ok(v)
-            });
+            let check = states
+                .as_ref()
+                .ok_or_else(|| ReapError::from("T3 state unreadable"))
+                .and_then(|states| eligible(tree, &trees, &scope, &initial_busy, states))
+                .and_then(|v| {
+                    if let Some(d) = &docker {
+                        d.check_worktree(&tree.path)?;
+                    } else if config.docker {
+                        return Err("Docker state unknown".into());
+                    }
+                    Ok(v)
+                });
             match check {
                 Ok((info, ids, _files)) => {
                     println!(
@@ -797,30 +840,11 @@ pub fn run(config: &Config, home: &Path, apply: bool) -> Result<()> {
                         }
                     }
                     if apply {
-                        // Re-read live ownership immediately before snapshot/removal.
-                        let current =
-                            threads(&config.reap.state).unwrap_or_else(|_| BTreeMap::new());
-                        let (info, ids, files) =
-                            eligible(tree, &worktrees(&tree.path)?, &scope, &busy()?, &current)?;
-                        let record = snapshot(&tree.path, home, ids, &info, files)?;
-                        if busy()?.iter().any(|p| p.starts_with(&tree.path)) {
-                            return Err("worktree became busy after snapshot; retained".into());
+                        if let Err(e) = reap_one(tree, &scope, config, home, docker.as_mut()) {
+                            skipped += 1;
+                            println!("SKIP {:?}: {e}", tree.path);
+                            continue;
                         }
-                        if let Some(d) = &mut docker {
-                            d.remove_worktree(&tree.path)?;
-                        }
-                        verify_snapshot(&record, &scope)?;
-                        git(
-                            &record.common_dir,
-                            &[
-                                OsStr::new("worktree"),
-                                OsStr::new("remove"),
-                                OsStr::new("--force"),
-                                OsStr::new("--"),
-                                tree.path.as_os_str(),
-                            ],
-                        )?;
-                        text(&record.common_dir, &["worktree", "prune"])?;
                     }
                     reaped_paths.push(tree.path.clone());
                     count += 1;
@@ -952,11 +976,22 @@ fn anonymous_old(v: &Volume, hours: u64) -> bool {
         && v.name
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        && v.labels.as_ref().is_none_or(BTreeMap::is_empty)
+        && v.labels
+            .as_ref()
+            .is_none_or(|labels| labels.keys().all(|k| k == "com.docker.volume.anonymous"))
         && timestamp(&v.created_at).is_ok_and(|t| {
             Utc::now().signed_duration_since(t).num_seconds()
                 > i64::try_from(hours.saturating_mul(3600)).unwrap_or(i64::MAX)
         })
+}
+/// Compose's default project name: the directory name, lowercased, keeping `[a-z0-9_-]`.
+fn default_compose_project(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
 }
 impl Docker {
     fn load() -> Result<Self> {
@@ -996,52 +1031,49 @@ impl Docker {
             .iter()
             .any(|c| c.mounts.iter().any(|m| m.name.as_deref() == Some(name)))
     }
+    /// Named volumes owned by this worktree's compose project and mounted by its containers.
+    /// Compose names a project after its directory unless the file sets `name:`; a fixed name
+    /// may be shared with the main checkout, so only the directory-derived project qualifies.
+    fn owned_volumes(&self, path: &Path) -> HashSet<String> {
+        let project = default_compose_project(path);
+        self.containers
+            .iter()
+            .filter(|c| Self::compose_inside(c, path))
+            .flat_map(|c| c.mounts.iter().filter_map(|m| m.name.clone()))
+            .filter(|name| {
+                self.volumes.iter().any(|v| {
+                    v.name == *name
+                        && label(&v.labels, "com.docker.compose.project") == Some(project.as_str())
+                })
+            })
+            .collect()
+    }
     fn preview_worktree(&self, path: &Path) {
-        let mut projects = HashSet::new();
         for c in &self.containers {
             if Self::compose_inside(c, path) && !c.state.running {
                 println!(
                     "WOULD REMOVE compose container {} with anonymous volumes",
                     c.id
                 );
-                if let Some(project) = label(&c.config.labels, "com.docker.compose.project") {
-                    projects.insert(project);
-                }
             }
         }
-        for v in &self.volumes {
-            if label(&v.labels, "com.docker.compose.project").is_some_and(|p| projects.contains(p))
-                && self
-                    .containers
-                    .iter()
-                    .filter(|c| c.mounts.iter().any(|m| m.name.as_deref() == Some(&v.name)))
-                    .all(|c| Self::compose_inside(c, path))
-            {
-                println!(
-                    "WOULD REMOVE compose volume {} if dangling after container removal",
-                    v.name
-                );
-            }
+        for name in self.owned_volumes(path) {
+            println!("WOULD REMOVE compose volume {name} if unused after container removal");
         }
     }
     fn remove_worktree(&mut self, path: &Path) -> Result<()> {
         *self = Self::load()?;
         self.check_worktree(path)?;
-        let mut projects = HashSet::new();
+        let owned = self.owned_volumes(path);
         for c in &self.containers {
             if Self::compose_inside(c, path) {
-                if let Some(project) = label(&c.config.labels, "com.docker.compose.project") {
-                    projects.insert(project.to_owned());
-                }
                 docker(&["container", "rm", "-v", "--", &c.id])?;
             }
         }
         *self = Self::load()?;
-        for v in &self.volumes {
-            if label(&v.labels, "com.docker.compose.project").is_some_and(|p| projects.contains(p))
-                && !self.referenced(&v.name)
-            {
-                stores::remove_volume(&v.name, true)?;
+        for name in &owned {
+            if !self.referenced(name) {
+                stores::remove_volume(name, true)?;
             }
         }
         *self = Self::load()?;
@@ -1101,6 +1133,11 @@ mod tests {
         assert!(anonymous_old(&volumes[0], 24));
         assert!(!anonymous_old(&volumes[1], 24));
         assert!(!anonymous_old(&volumes[2], 24));
+        let marked: Volume = serde_json::from_str(&format!(
+            r#"{{"Name":"{hex}","CreatedAt":"2000-01-01T00:00:00Z","Labels":{{"com.docker.volume.anonymous":""}}}}"#
+        ))
+        .unwrap();
+        assert!(anonymous_old(&marked, 24));
         let containers: Vec<Container> = serde_json::from_str(r#"[{"Id":"running","Config":{"Labels":{"com.docker.compose.project.working_dir":"/agent/lane/app"}},"State":{"Running":true},"Mounts":[{"Name":"database"}]}]"#).unwrap();
         let d = Docker {
             containers,
@@ -1118,6 +1155,25 @@ mod tests {
             "dev-sweep.owner".into(),
             tmp.path().join("missing").to_str().unwrap().into()
         )]))));
+    }
+    #[test]
+    fn worktree_reap_only_claims_its_own_compose_project_volumes() {
+        let containers: Vec<Container> = serde_json::from_str(r#"[
+            {"Id":"own","Config":{"Labels":{"com.docker.compose.project.working_dir":"/agent/T3-ab_c","com.docker.compose.project":"t3-ab_c"}},"State":{"Running":false},"Mounts":[{"Name":"t3-ab_c_db"},{"Name":"shared_db"}]}
+        ]"#).unwrap();
+        let volumes: Vec<Volume> = serde_json::from_str(r#"[
+            {"Name":"t3-ab_c_db","CreatedAt":"2000-01-01T00:00:00Z","Labels":{"com.docker.compose.project":"t3-ab_c"}},
+            {"Name":"shared_db","CreatedAt":"2000-01-01T00:00:00Z","Labels":{"com.docker.compose.project":"boomerplay"}},
+            {"Name":"other_db","CreatedAt":"2000-01-01T00:00:00Z","Labels":{"com.docker.compose.project":"t3-ab_c"}}
+        ]"#).unwrap();
+        let d = Docker {
+            containers,
+            volumes,
+        };
+        assert_eq!(
+            d.owned_volumes(Path::new("/agent/T3-ab_c")),
+            HashSet::from(["t3-ab_c_db".to_owned()])
+        );
     }
     #[test]
     fn vanished_stats_entry_is_not_an_io_failure() {
