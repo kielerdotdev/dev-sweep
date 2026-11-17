@@ -4,14 +4,16 @@ set -euo pipefail
 schedule=true
 mode=scan
 uninstall=false
+reap=false
 for arg in "$@"; do
   case "$arg" in
+    --reap) reap=true ;;
     --no-schedule) schedule=false ;;
     --report-only) mode=scan ;;
     --automatic-cleanup) mode=clean ;;
     --uninstall) uninstall=true ;;
     --help)
-      printf '%s\n' 'Usage: ./install.sh [--no-schedule | --report-only | --automatic-cleanup | --uninstall]' \
+      printf '%s\n' 'Usage: ./install.sh [--no-schedule | --report-only | --automatic-cleanup | --uninstall] [--reap]' \
         'Default: install locally and enable daily reports at 03:00. Cleanup requires approval.'
       exit 0 ;;
     *) printf 'Unknown option: %s\n' "$arg" >&2; exit 1 ;;
@@ -28,6 +30,9 @@ dev_sweep_os=$(uname -s)
 if $uninstall; then
   case "$dev_sweep_os" in
     Linux)
+      systemctl --user disable --now dev-sweep-reap.timer 2>/dev/null || true
+      systemctl --user stop dev-sweep-reap.service 2>/dev/null || true
+      rm -f -- "$dev_sweep_unit_dir/dev-sweep-reap.timer" "$dev_sweep_unit_dir/dev-sweep-reap.service"
       systemctl --user disable --now dev-sweep.timer 2>/dev/null || true
       systemctl --user stop dev-sweep.service 2>/dev/null || true
       rm -f -- "$dev_sweep_unit_dir/dev-sweep.timer" "$dev_sweep_unit_dir/dev-sweep.service"
@@ -94,7 +99,24 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+    if $reap; then
+      sed "s/ $mode$dev_sweep_apply --config / reap --apply --config /; s/Report development storage cleanup candidates/Reap finished agent work/" \
+        "$dev_sweep_unit_dir/dev-sweep.service" > "$dev_sweep_unit_dir/dev-sweep-reap.service"
+      cat > "$dev_sweep_unit_dir/dev-sweep-reap.timer" <<'EOF'
+[Unit]
+Description=Hourly agent worktree cleanup
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    fi
     systemctl --user daemon-reload
+    if $reap; then systemctl --user enable --now dev-sweep-reap.timer; fi
     systemctl --user enable --now dev-sweep.timer
     printf 'Daily %s enabled. Logs: journalctl --user -u dev-sweep.service\n' "$mode"
     systemctl --user list-timers dev-sweep.timer --no-pager ;;

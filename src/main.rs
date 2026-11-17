@@ -14,19 +14,22 @@ use std::time::{Duration, SystemTime};
 
 mod advice;
 mod inventory;
+mod reap;
 mod stores;
 mod tui;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const HELP: &str = "dev-sweep: reclaim space from stale development artifacts
 
-Usage: dev-sweep [tui|scan|audit|clean|init|clean-store STORE|remove-worktree PATH|remove-volume NAME] [OPTIONS]
+Usage: dev-sweep [tui|scan|audit|clean|reap|restore PATH|init|clean-store STORE|remove-worktree PATH|remove-volume NAME] [OPTIONS]
 
   tui                     Browse storage, request AI advice, approve selections
   scan                    Preview stale caches and worktrees (default)
   audit                   Rank disk usage and report managed stores, even if kept
   clean --apply           Delete stale generated caches; prune enabled stores
   clean                   Same preview as scan
+  reap                    Snapshot finished agent worktrees; --apply requires reap=true
+  restore PATH            Restore a reaped worktree (preview unless --apply)
   init                    Discover projects and write a config, without overwriting
   remove-worktree PATH    Preview removal of one clean, idle linked worktree
   clean-store STORE       Preview a native store cleanup (use --apply to run)
@@ -35,7 +38,7 @@ Usage: dev-sweep [tui|scan|audit|clean|init|clean-store STORE|remove-worktree PA
 Stores: uv, nix, docker-build, apt, journal
 
 Options:
-  --apply                 Actually delete (clean/remove-worktree only)
+  --apply                 Execute cleanup or restore (preview by default)
   --root PATH             Scan root, repeatable; replaces configured roots
   --exclude PATH          Protect a subtree, repeatable
   --days N                Minimum idle age, default 30, minimum 1
@@ -45,7 +48,7 @@ Options:
   --config PATH           Config file (default ~/.config/dev-sweep/config)
   --help                  Show this help
 
-Worktrees are NEVER removed by clean or the automatic job.
+Scan and clean never remove worktrees. Reap snapshots before removal and requires reap=true.
 Create .dev-sweep-keep in any directory to protect its entire subtree.
 ";
 
@@ -56,6 +59,7 @@ struct Config {
     days: u64,
     docker: bool,
     global_caches: bool,
+    reap: reap::Settings,
 }
 
 impl Config {
@@ -82,6 +86,7 @@ impl Config {
             days: 30,
             docker: true,
             global_caches: true,
+            reap: reap::Settings::new(home),
         }
     }
 
@@ -104,6 +109,15 @@ impl Config {
                 "days" => config.days = parse_days(value.trim())?,
                 "docker" => config.docker = value.trim().parse()?,
                 "global_caches" => config.global_caches = value.trim().parse()?,
+                "reap"
+                | "agent_root"
+                | "t3_state"
+                | "reap_after_hours"
+                | "orphan_idle_days"
+                | "artifact_idle_days"
+                | "volume_after_hours"
+                | "snapshot_max_file_mb"
+                | "snapshot_max_total_mb" => config.reap.set(key.trim(), value.trim(), home)?,
                 key => return Err(format!("unknown config key {key:?}").into()),
             }
         }
@@ -272,14 +286,14 @@ fn run() -> Result<()> {
         let arg = &args[i];
         match arg.as_str() {
             "tui" | "scan" | "audit" | "clean" | "init" | "remove-worktree" | "clean-store"
-            | "remove-volume"
+            | "remove-volume" | "reap" | "restore"
                 if i == 0 =>
             {
                 action = arg;
-                if action == "remove-worktree" {
+                if action == "remove-worktree" || action == "restore" {
                     i += 1;
                     worktree = Some(expand(
-                        args.get(i).ok_or("remove-worktree needs a path")?,
+                        args.get(i).ok_or("command needs a worktree path")?,
                         &home,
                     )?);
                 }
@@ -311,7 +325,17 @@ fn run() -> Result<()> {
         }
         i += 1;
     }
-    if apply && !["clean", "remove-worktree", "clean-store", "remove-volume"].contains(&action) {
+    if apply
+        && ![
+            "clean",
+            "remove-worktree",
+            "clean-store",
+            "remove-volume",
+            "reap",
+            "restore",
+        ]
+        .contains(&action)
+    {
         return Err("--apply is only valid with a cleanup/removal command".into());
     }
     if system && action != "audit" {
@@ -340,6 +364,7 @@ fn run() -> Result<()> {
             "# dev-sweep: paths are unquoted; root/exclude can repeat\ndays={}\ndocker={}\nglobal_caches={}",
             config.days, config.docker, config.global_caches
         )?;
+        config.reap.write(&mut file)?;
         for path in &config.roots {
             writeln!(file, "root={}", path.display())?;
         }
@@ -377,6 +402,16 @@ fn run() -> Result<()> {
     }
     if action == "tui" {
         return tui::run(config, home);
+    }
+    if action == "reap" {
+        return Ok(reap::run(&config, &home, apply)?);
+    }
+    if action == "restore" {
+        return Ok(reap::restore(
+            &home,
+            &worktree.ok_or("missing restore path")?,
+            apply,
+        )?);
     }
     if config.roots.is_empty() {
         return Err("no scan roots; run init or pass --root PATH".into());

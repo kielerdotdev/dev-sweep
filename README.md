@@ -2,7 +2,7 @@
 
 Find old development files, check what they belong to, and choose what to remove in a terminal UI.
 
-It handles project `node_modules`, Rust build output, Git worktrees, and Docker images and build cache. It leaves global npm, Bun, and pnpm caches alone. Cleanup always needs your approval. The daily job only reports what it finds.
+It handles project `node_modules`, Rust build output, Git worktrees, and Docker images and build cache. It leaves global npm, Bun, and pnpm caches alone. Scan and clean require approval for deletion. The daily job only reports what it finds. Optional reap automation snapshots finished agent work before removing its checkout.
 
 Requires Linux or macOS and Rust 1.85 or newer.
 
@@ -154,6 +154,8 @@ Commands preview their actions unless you add `--apply`.
 
 ```sh
 dev-sweep scan
+dev-sweep reap
+dev-sweep restore /absolute/path/to/reaped/worktree
 dev-sweep audit
 dev-sweep audit --system
 dev-sweep remove-worktree /absolute/path/to/worktree
@@ -207,3 +209,97 @@ python3 tests/scan_benchmark.py target/release/dev-sweep
 ```
 
 Tests create disposable projects and worktrees, and mock package managers and Docker. They cover refusal checks, changed files, model responses, terminal confirmation, and scan cancellation. They do not clean the host's projects or stores.
+
+## Automatic agent cleanup and recovery
+
+`dev-sweep reap` previews finished linked worktrees under `agent_root` paths, idle
+artifacts, and selected Docker leftovers. `reap --apply` refuses unless the config
+contains `reap=true`. Scan and clean never remove worktrees; explicit
+`remove-worktree` retains its existing clean/reachable/idle checks.
+
+```ini
+reap=false
+agent_root=~/.t3/worktrees
+agent_root=~/.codex/worktrees
+t3_state=~/.t3/userdata/statev2.sqlite
+reap_after_hours=12
+orphan_idle_days=3
+artifact_idle_days=2
+volume_after_hours=24
+snapshot_max_file_mb=50
+snapshot_max_total_mb=200
+```
+
+These are the defaults. Repeat `agent_root` to replace the default agent roots.
+These roots are independent of ordinary `root` entries and `--root`; exclusions
+and keep markers still apply. Durations and MiB limits are positive integers.
+`init` writes all these keys, with reap disabled.
+
+T3 is opened strictly read-only, including when its live database uses WAL.
+Every referencing thread must be archived, deleted, or explicitly settled with a
+settlement timestamp. An active override wins over a stale settlement timestamp.
+The newest completion or update must be at least `reap_after_hours` old. Missing,
+unreadable or unrecognised T3 data is unknown; only the conservative orphan idle
+rule can then qualify a worktree. Orphans need both filesystem and Git inactivity.
+Other agents use that same orphan rule. Main, bare, locked, busy, protected,
+submodule-containing and nested-repository worktrees stay. Large untracked or
+ignored non-artifact files block snapshots at the per-file or total limit.
+
+Before removing a worktree, reap uses a temporary Git index to snapshot tracked,
+untracked non-ignored and small ignored non-artifact files. This includes `.env`.
+Recognised ignored artifacts such as node_modules, target, .next, .turbo and Python
+environments are regenerable and excluded. The snapshot commit lives in the shared
+repository as `refs/dev-sweep/wip/<project>/<worktree>`. Repeated snapshots get a
+unique timestamp suffix. A companion `refs/dev-sweep/index/...` ref preserves staged-only content.
+Branches and unpushed commits stay local; default push refspecs do not push these refs.
+The fsynced journal at `~/.local/state/dev-sweep/reaped.jsonl` records the original
+path, common Git directory, branch, HEAD, refs, thread ids, estimated bytes and time
+before worktree removal. Interrupted removals can therefore leave recoverable journal
+entries for worktrees that still exist.
+
+```sh
+dev-sweep restore /original/worktree/path
+dev-sweep restore /original/worktree/path --apply
+```
+
+Reap checks content and staging again immediately before removal.
+
+Restore uses the latest journal entry and refuses an existing destination. It
+restores the original HEAD and branch when that branch is still available at the
+same commit. A missing, moved or occupied branch restores detached at the original
+HEAD. Unborn branches restore unborn. Files and the original staging boundary are
+restored, including untracked and ignored files.
+
+The lossless guarantee covers Git-representable source content and staging, not
+regenerable artifacts or Docker data. Snapshots share the repository's failure
+domain: keep the common repository, journal and snapshot refs. This is not an
+external backup. Git does not preserve empty directories, timestamps, extended
+attributes or all permission bits; configured clean/smudge filters and encodings
+retain Git's normal semantics. Process inspection can be denied, and concurrent
+writers can race cleanup: protect services and important offline data with keep
+markers or exclusions. Snapshots can contain secrets, so protect local repository
+access. Reap does not upload or push anything.
+
+Remaining linked agent worktrees use `artifact_idle_days` for recognised build and
+dependency directories, with the existing process, ownership, marker and tracked-file
+checks. Ordinary main checkouts retain the configured `days` rule.
+
+Docker inspection uses bounded list/inspect calls, never `docker system df -v`.
+Only dangling, unlabelled volumes with exactly 64 lowercase hex characters and an
+old enough creation time qualify as anonymous. Named volumes qualify only with
+`dev-sweep.owner=/absolute/path` pointing to a missing path. Stopped containers with
+that label and a missing owner are removed with `docker container rm -v`; running
+containers stay. Reaping also removes stopped Compose containers whose working
+directory lies in the worktree, then dangling volumes labelled for those Compose
+projects. Running Compose or owner containers block worktree removal. Volume removal
+rechecks container references and never uses force or prune. This intentionally deletes
+orphan database contents: anonymous names and age cannot prove data is unwanted.
+Keep important persistent volumes named and without orphan-owner labels. Unavailable
+or slow Docker is skipped; when Docker checking is enabled, unknown Docker state also
+blocks worktree removal. `docker=false` or `--no-docker` explicitly disables those checks.
+
+On Linux, `bash install.sh --reap` additionally installs and enables an hourly
+`dev-sweep-reap.timer` running `reap --apply` with Nice=10 and idle I/O. It still
+requires `reap=true` in the config. This flag does not change your config or enable
+reap on macOS. `--no-schedule` suppresses all timers. Uninstall removes both timers.
+Inspect logs with `journalctl --user -u dev-sweep-reap.service`.

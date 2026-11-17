@@ -861,6 +861,7 @@ mod tests {
             days: 30,
             docker: false,
             global_caches: false,
+            reap: reap::Settings::new(&home),
         };
         let (tx, _) = std::sync::mpsc::channel();
         let item = path_item(

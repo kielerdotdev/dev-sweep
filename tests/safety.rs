@@ -715,6 +715,220 @@ fn broad_scans_preserve_global_node_paths_and_clean_project_dependencies() {
     assert!(home.join("projects/local/package.json").exists());
 }
 
+fn reap_run(f: &Fixture, args: &[&str]) -> Output {
+    fs::create_dir_all(f.0.join("home")).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_dev-sweep"))
+        .args(args)
+        .arg("--config")
+        .arg(f.0.join("config"))
+        .env("HOME", f.0.join("home"))
+        .current_dir(std::env::temp_dir())
+        .output()
+        .unwrap()
+}
+fn reap_fixture() -> (Fixture, PathBuf, PathBuf) {
+    let f = Fixture::new();
+    let repo = f.0.join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "--initial-branch=main"]);
+    fs::write(repo.join("source"), "original").unwrap();
+    fs::write(repo.join(".gitignore"), ".env\nnode_modules/\n").unwrap();
+    fs::write(repo.join("package.json"), "{}").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+    let path = f.0.join("agents/project/lane");
+    git(
+        &repo,
+        &["worktree", "add", "-b", "lane", path.to_str().unwrap()],
+    );
+    f.file("config", &format!("reap=true\ndocker=false\nglobal_caches=false\nagent_root={}\nt3_state={}\nsnapshot_max_file_mb=1\n", f.0.join("agents").display(), f.0.join("state.sqlite").display()));
+    (f, repo, path)
+}
+fn thread_db(f: &Fixture, path: &Path, active: bool) {
+    let db = rusqlite::Connection::open(f.0.join("state.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT, archived_at TEXT, deleted_at TEXT, updated_at TEXT, payload_json TEXT)").unwrap();
+    let payload = serde_json::json!({"worktreePath": path, "settledOverride": if active {"active"} else {"settled"}, "settledAt": "2000-01-01T00:00:00Z"});
+    db.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('thread',NULL,NULL,'2000-01-01T00:00:00Z',?1)", [payload.to_string()]).unwrap();
+}
+#[test]
+fn reap_restore_preserves_dirty_staged_untracked_ignored_and_branch() {
+    let (f, repo, path) = reap_fixture();
+    thread_db(&f, &path, false);
+    fs::write(path.join("source"), "staged").unwrap();
+    git(&path, &["add", "source"]);
+    fs::write(path.join("source"), "dirty tracked").unwrap();
+    fs::write(path.join("new"), "untracked").unwrap();
+    fs::write(path.join(".env"), "secret").unwrap();
+    f.file("agents/project/lane/node_modules/generated", "regenerable");
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+    success(&reap_run(&f, &["reap"]));
+    assert!(path.exists());
+    success(&reap_run(&f, &["reap", "--apply"]));
+    assert!(!path.exists());
+    success(&reap_run(&f, &["restore", path.to_str().unwrap()]));
+    assert!(!path.exists());
+    success(&reap_run(
+        &f,
+        &["restore", path.to_str().unwrap(), "--apply"],
+    ));
+    assert_eq!(
+        fs::read_to_string(path.join("source")).unwrap(),
+        "dirty tracked"
+    );
+    assert_eq!(fs::read_to_string(path.join("new")).unwrap(), "untracked");
+    assert_eq!(fs::read_to_string(path.join(".env")).unwrap(), "secret");
+    assert!(!path.join("node_modules").exists());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["show", ":source"])
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(output.stdout, b"staged");
+    let after = Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(after.stdout, head);
+    git(&path, &["symbolic-ref", "--short", "HEAD"]);
+    // A second snapshot must not overwrite the first.
+    success(&reap_run(&f, &["reap", "--apply"]));
+    let refs = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["for-each-ref", "--format=%(refname)", "refs/dev-sweep/wip/"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(refs.stdout).unwrap().lines().count(), 2);
+}
+#[test]
+fn reap_refuses_large_nested_busy_locked_and_active_worktrees() {
+    for reason in [
+        "large",
+        "nested",
+        "busy",
+        "locked",
+        "active",
+        "keep",
+        "submodule",
+    ] {
+        let (f, _repo, path) = reap_fixture();
+        thread_db(&f, &path, reason == "active");
+        let mut child = None;
+        match reason {
+            "large" => {
+                fs::write(path.join("big"), vec![0; 1024 * 1024 + 1]).unwrap();
+            }
+            "nested" => {
+                fs::create_dir(path.join("nested")).unwrap();
+                git(&path.join("nested"), &["init"]);
+            }
+            "busy" => {
+                child = Some(
+                    Command::new("sleep")
+                        .arg("60")
+                        .current_dir(&path)
+                        .spawn()
+                        .unwrap(),
+                );
+            }
+            "locked" => git(&path, &["worktree", "lock", path.to_str().unwrap()]),
+            "keep" => {
+                fs::write(path.join(".dev-sweep-keep"), "").unwrap();
+            }
+            "submodule" => {
+                fs::write(path.join(".gitmodules"), "").unwrap();
+            }
+            _ => (),
+        }
+        let output = reap_run(&f, &["reap", "--apply"]);
+        success(&output);
+        assert!(
+            path.exists(),
+            "must retain {reason}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if let Some(mut child) = child {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+    }
+}
+#[test]
+fn reap_missing_db_requires_orphan_idle_and_restores_detached_unpushed_commit() {
+    let (f, _repo, path) = reap_fixture();
+    success(&reap_run(&f, &["reap", "--apply"]));
+    assert!(path.exists());
+    git(&path, &["checkout", "--detach"]);
+    fs::write(path.join("source"), "unpushed").unwrap();
+    git(&path, &["add", "."]);
+    git(&path, &["commit", "-m", "unpushed"]);
+    let before = Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+    age(&f.0);
+    success(&reap_run(&f, &["reap", "--apply"]));
+    assert!(!path.exists());
+    success(&reap_run(
+        &f,
+        &["restore", path.to_str().unwrap(), "--apply"],
+    ));
+    assert_eq!(fs::read_to_string(path.join("source")).unwrap(), "unpushed");
+    let after = Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(before, after);
+    assert!(!Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .status()
+        .unwrap()
+        .success());
+}
+#[test]
+fn reap_restore_unborn_head() {
+    let (f, repo, path) = reap_fixture();
+    git(&path, &["switch", "--orphan", "unborn"]);
+    fs::write(path.join("draft"), "unborn draft").unwrap();
+    thread_db(&f, &path, false);
+    success(&reap_run(&f, &["reap", "--apply"]));
+    assert!(!path.exists());
+    success(&reap_run(
+        &f,
+        &["restore", path.to_str().unwrap(), "--apply"],
+    ));
+    assert_eq!(
+        fs::read_to_string(path.join("draft")).unwrap(),
+        "unborn draft"
+    );
+    assert!(!Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    git(&repo, &["show-ref", "--verify", "refs/heads/main"]);
+}
 #[test]
 fn scan_handles_dangling_symlink() {
     let f = Fixture::new();
@@ -725,3 +939,76 @@ fn scan_handles_dangling_symlink() {
     success(&f.run(&["scan"]));
 }
 
+#[test]
+fn reap_is_opt_in_and_shared_active_thread_blocks_settled_thread() {
+    let (f, _repo, path) = reap_fixture();
+    thread_db(&f, &path, false);
+    let db = rusqlite::Connection::open(f.0.join("state.sqlite")).unwrap();
+    let active =
+        serde_json::json!({"worktreePath": path, "settledOverride":"active", "settledAt": null});
+    db.execute("INSERT INTO orchestration_v2_projection_threads VALUES ('active',NULL,NULL,'2000-01-01T00:00:00Z',?1)", [active.to_string()]).unwrap();
+    success(&reap_run(&f, &["reap", "--apply"]));
+    assert!(path.exists());
+    let config = fs::read_to_string(f.0.join("config"))
+        .unwrap()
+        .replace("reap=true", "reap=false");
+    fs::write(f.0.join("config"), config).unwrap();
+    assert!(!reap_run(&f, &["reap", "--apply"]).status.success());
+}
+#[test]
+fn active_agent_artifact_age_does_not_apply_to_main_checkout() {
+    let (f, repo, path) = reap_fixture();
+    thread_db(&f, &path, true);
+    f.file("agents/project/lane/node_modules/dependency", "generated");
+    f.file("repo/node_modules/dependency", "generated");
+    let old = SystemTime::now() - Duration::from_secs(4 * 86400);
+    for p in [&path, &repo] {
+        for file in [p.join("node_modules/dependency"), p.join("node_modules")] {
+            File::open(file)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(old).set_accessed(old))
+                .unwrap();
+        }
+    }
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(f.0.join("config"))
+        .unwrap();
+    use std::io::Write;
+    writeln!(config, "root={}", repo.display()).unwrap();
+    success(&reap_run(&f, &["reap", "--apply"]));
+    assert!(!path.join("node_modules").exists());
+    assert!(repo.join("node_modules").exists());
+    assert!(path.exists());
+}
+
+#[test]
+fn restore_detaches_if_original_branch_is_occupied_or_deleted() {
+    for occupied in [true, false] {
+        let (f, repo, path) = reap_fixture();
+        thread_db(&f, &path, false);
+        fs::write(path.join("source"), "restore me").unwrap();
+        success(&reap_run(&f, &["reap", "--apply"]));
+        if occupied {
+            git(&repo, &["checkout", "lane"]);
+        } else {
+            git(&repo, &["branch", "-D", "lane"]);
+        }
+        success(&reap_run(
+            &f,
+            &["restore", path.to_str().unwrap(), "--apply"],
+        ));
+        assert_eq!(
+            fs::read_to_string(path.join("source")).unwrap(),
+            "restore me"
+        );
+        assert!(!Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+}
