@@ -543,7 +543,12 @@ fn stats_inner(
         if stores::scan_cancelled() {
             return Err("Scan cancelled".into());
         }
-        let meta = fs::symlink_metadata(&path)?;
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            // Files may disappear during a live scan; symlinks themselves are measured.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         if meta.dev() != device {
             return Err(format!("different filesystem inside {:?}", path).into());
         }

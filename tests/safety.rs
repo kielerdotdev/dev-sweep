@@ -714,3 +714,14 @@ fn broad_scans_preserve_global_node_paths_and_clean_project_dependencies() {
     assert!(!home.join("projects/local/node_modules").exists());
     assert!(home.join("projects/local/package.json").exists());
 }
+
+#[test]
+fn scan_handles_dangling_symlink() {
+    let f = Fixture::new();
+    f.file("project/package.json", "{}");
+    f.file("project/node_modules/file", "cache");
+    symlink("missing", f.0.join("project/node_modules/dangling")).unwrap();
+    age(&f.0);
+    success(&f.run(&["scan"]));
+}
+
